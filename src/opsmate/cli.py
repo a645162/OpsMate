@@ -889,7 +889,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ensure_utf8() -> None:
+    """Windows 控制台默认 cp1252，中文会炸；统一改成 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _ensure_utf8()
     args = build_parser().parse_args(argv)
     return int(args.func(args) or 0)
 
