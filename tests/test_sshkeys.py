@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from opsmate import sshkeys
@@ -15,7 +17,8 @@ def test_generate_list_delete(tmp_path):
     key = sshkeys.generate_key("id_test", comment="opsmate-test", directory=tmp_path)
     assert key.private_path.exists()
     assert key.public_path.exists()
-    assert key.private_path.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert key.private_path.stat().st_mode & 0o777 == 0o600
     assert key.public_text().startswith("ssh-ed25519")
 
     keys = sshkeys.list_keys(tmp_path)

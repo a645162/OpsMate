@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import stat
 import subprocess
@@ -49,6 +50,9 @@ def check_auth() -> Check:
     path = landui_auth_path()
     if not path.exists():
         return Check("登录态", FAIL, f"缺失：{path}（先在 LanduiSDK 里登录一次）")
+    if os.name == "nt":
+        # Windows 的 ACL 不体现在 st_mode 上，不做 POSIX 权限判断
+        return Check("登录态", OK, str(path))
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
         return Check("登录态", WARN, f"{path} 权限 {oct(mode)}，建议 chmod 600")

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import stat
+
+import pytest
 
 from opsmate import __version__, config, doctor
 from opsmate.cli import main
@@ -35,6 +38,7 @@ def test_check_auth_missing(tmp_path, monkeypatch):
     assert "缺失" in check.detail
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有 POSIX 权限位")
 def test_check_auth_permissions(tmp_path, monkeypatch):
     path = tmp_path / "auth.json"
     path.write_text("{}", "utf-8")
