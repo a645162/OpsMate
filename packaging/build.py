@@ -58,6 +58,11 @@ def build(target: str, *, console: bool) -> None:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser()
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--cli", action="store_true")

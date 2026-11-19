@@ -8,6 +8,8 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +40,8 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
         with:
