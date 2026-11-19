@@ -28,7 +28,19 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y --no-progress
       - name: Build installer
-        run: makensis packaging/installer.nsi
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files (x86)\NSIS\makensis.exe",
+            "C:\Program Files\NSIS\makensis.exe"
+          )
+          $nsis = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $nsis) {
+            $nsis = (Get-ChildItem -Path "C:\Program Files*" -Filter makensis.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          }
+          if (-not $nsis) { throw "makensis not found" }
+          Write-Host "using $nsis"
+          & $nsis packaging/installer.nsi
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
