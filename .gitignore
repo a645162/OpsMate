@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# 本机登录态 / 凭据，绝不提交
+config.json
+auth.json
+credentials.json
+*.pem
+*.key
