@@ -63,3 +63,85 @@ def test_upload_missing_file(tmp_path):
         pass
     else:  # pragma: no cover
         raise AssertionError("应当抛 FileNotFoundError")
+
+
+class RemoteClient(FakeClient):
+    def __init__(self, contents, download_bytes=b""):
+        super().__init__()
+        self.contents = contents
+        self.download_bytes = download_bytes
+        self.deleted = []
+        self.calls = []
+
+    def list_objects_v2(self, **kwargs):
+        return {"Contents": self.contents, "IsTruncated": False}
+
+    def delete_object(self, Bucket, Key):
+        self.deleted.append(Key)
+        self.calls.append(("delete", Bucket, Key))
+
+    def download_file(self, bucket, key, filename):
+        self.calls.append(("download", bucket, key, filename))
+        Path(filename).write_bytes(self.download_bytes)
+
+
+def _obj(key, ts):
+    import datetime as dt
+
+    return {"Key": key, "LastModified": dt.datetime(2026, 1, ts)}
+
+
+def test_prune_remote_keeps_newest():
+    client = RemoteClient([
+        _obj("p/a-1.sql.gz", 1),
+        _obj("p/a-2.sql.gz", 2),
+        _obj("p/a-3.sql.gz", 3),
+        _obj("p/other.sql.gz", 4),
+    ])
+    target = storage.StorageTarget(name="s", bucket="b")
+    removed = storage.prune_remote(
+        target, prefix="p/", match="a-", keep=2, client=client
+    )
+    assert removed == ["p/a-1.sql.gz"]
+    assert client.deleted == ["p/a-1.sql.gz"]
+
+
+def test_prune_remote_dry_run():
+    client = RemoteClient([_obj("p/a-1.sql.gz", 1), _obj("p/a-2.sql.gz", 2)])
+    target = storage.StorageTarget(name="s", bucket="b")
+    removed = storage.prune_remote(
+        target, prefix="p/", keep=1, dry_run=True, client=client
+    )
+    assert removed == ["p/a-1.sql.gz"]
+    assert client.deleted == []
+
+
+def test_verify_remote_ok(tmp_path):
+    local = tmp_path / "x.bin"
+    local.write_bytes(b"hello")
+    client = RemoteClient([], download_bytes=b"hello")
+    target = storage.StorageTarget(name="s", bucket="b")
+    assert storage.verify_remote(target, local, "k", client=client)
+
+
+def test_verify_remote_mismatch(tmp_path):
+    local = tmp_path / "x.bin"
+    local.write_bytes(b"hello")
+    client = RemoteClient([], download_bytes=b"tampered")
+    target = storage.StorageTarget(name="s", bucket="b")
+    try:
+        storage.verify_remote(target, local, "k", client=client)
+    except storage.StorageError as exc:
+        assert "SHA-256" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("应当校验失败")
+
+
+def test_parse_uri():
+    assert storage.parse_uri("s3://b/k/x.bin") == ("b", "k/x.bin")
+    try:
+        storage.parse_uri("http://x")
+    except storage.StorageError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("应当抛错")

@@ -1,5 +1,8 @@
 # OpsMate · 运维助手
 
+> ![CI](https://github.com/a645162/OpsMate/actions/workflows/ci.yml/badge.svg)
+> ![Build](https://github.com/a645162/OpsMate/actions/workflows/build.yml/badge.svg)
+>
 > 本地优先的服务器运维台：**主机清单、SSH 密钥、~/.ssh/config、终端配置、数据库备份**，
 > 一个窗口 / 一套命令搞定。Windows、Linux、macOS 都能跑。
 >
@@ -98,6 +101,12 @@ ops dns rm cf example.com <record_id> --yes
 * Cloudflare 走 API Token；阿里云走 Aliyun DNS RPC（HMAC-SHA1 签名，已含在代码里）
 * 凭据存 `~/.config/opsmate/dns.json`（0600），建议用只含 DNS 权限的 RAM 子账号
 * GUI「DNS」页签：可直接添加/删除凭据、选域名、记录增删，支持代理开关与线路
+
+## CI / 自动构建
+
+* `.github/workflows/ci.yml`：Ubuntu + Windows 跑 `ruff` 与 59 个离线测试
+* `.github/workflows/build.yml`：手动或打 `v*` tag 时，在 Windows 构建 Nuitka
+  产物 + NSIS 安装包，在 Linux 构建 tar.gz，并上传 artifacts
 
 ## 打包（Nuitka + NSIS）
 

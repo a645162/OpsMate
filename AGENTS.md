@@ -42,7 +42,7 @@ src/opsmate/
   db.py          MySQL/PostgreSQL 备份恢复（local/docker、隧道复用、定时/保留、快照、加密、演练）
   crypto.py      AES-256-CTR + HMAC 的流式备份加密
   dns.py         Cloudflare / 阿里云解析（凭据 0600）
-  storage.py     S3/OSS 上传（boto3 可选，凭据 0600）
+  storage.py     S3/OSS 上传（boto3 可选，凭据 0600）、远端保留、下载校验
   gui/app.py     六个页签：服务器/密钥/配置/导出/数据库/DNS
   config.py      跨平台路径与私有 JSON
   doctor.py      自检（纯函数返回 Check，不 print）
@@ -72,6 +72,12 @@ uv run python scripts/db_docker_test.py
 - DNS 凭据只存 `~/.config/opsmate/dns.json`，对象存储凭据只存 `storage.json`；
   测试用 FakeSession / FakeClient，禁止真实调用。
 - boto3 属于可选 extra（`cloud`），核心代码必须在没有 boto3 时给出人话报错。
+- 上传后默认做 SHA-256 下载校验；远端清理必须传 `match`，避免误删同前缀的其它备份。
+
+## CI
+
+`.github/workflows/ci.yml` 跑双平台测试；`build.yml` 产出 Windows 安装包与 Linux
+压缩包。改打包参数时两处（脚本 + workflow）要同步。
 - 打包入口只放 `packaging/launcher_*.py`；不要从仓库根直接跑 Nuitka。
 - 恢复类操作默认走 `restore_with_safety()`；新增入口不要绕过它（除非显式 `--no-safety`）。
 - 定时任务只调用 `db.autobackup()`，它会按 `schedule_hours` 判断到期并 `prune(keep)`；

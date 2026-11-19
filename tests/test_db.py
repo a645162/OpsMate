@@ -243,6 +243,7 @@ def test_autobackup_uploads_when_configured(tmp_path, monkeypatch):
     )
     uploaded = []
     monkeypatch.setattr(storage, "upload", lambda dest, path: uploaded.append(path) or "s3://b/x")
+    monkeypatch.setattr(storage, "verify_remote", lambda *a, **k: "digest")
 
     results = db.autobackup(catalog=catalog)
     assert uploaded and "已上传" in results[0][1]

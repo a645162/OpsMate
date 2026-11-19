@@ -59,6 +59,7 @@ class DbTarget:
     keep: int = 7                                        # 保留最近几份
     last_backup: str = ""                                # ISO 时间
     upload_to: str = ""                                  # 对象存储目标名，空=不上传
+    remote_keep: int = 0                                 # 远端保留份数，0=不清理
     note: str = ""
     id: str = field(default_factory=new_id)
 
@@ -622,9 +623,22 @@ def autobackup(*, force: bool = False, catalog: DbCatalog | None = None) -> list
                     remote = f"（上传失败：找不到存储 {target.upload_to}）"
                 else:
                     try:
-                        remote = "，已上传 " + storage.upload(dest, path)
+                        uri = storage.upload(dest, path)
+                        remote = "，已上传 " + uri
+                        _, key = storage.parse_uri(uri)
+                        if dest.verify_after_upload:
+                            storage.verify_remote(dest, path, key)
+                            remote += "，校验通过"
+                        if target.remote_keep:
+                            prefix = key.rsplit("/", 1)[0] + "/"
+                            removed = storage.prune_remote(
+                                dest, prefix=prefix,
+                                match=f"{_slug(target.name)}-{target.engine}-",
+                                keep=target.remote_keep,
+                            )
+                            remote += f"，远端清理 {len(removed)} 份"
                     except Exception as exc:  # noqa: BLE001
-                        remote = f"（上传失败：{type(exc).__name__}: {exc}）"
+                        remote = f"（上传/校验失败：{type(exc).__name__}: {exc}）"
             removed = prune(target)
             target.last_backup = time.strftime("%Y-%m-%dT%H:%M:%S")
             changed = True

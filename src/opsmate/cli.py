@@ -337,6 +337,29 @@ def cmd_storage(args: argparse.Namespace) -> int:
         store.upsert(target)
         print(f"已保存存储：{target.id} {target.label}")
         return 0
+    if args.storage_cmd == "prune":
+        target = pick(store.targets, args.ref, "存储")
+        removed = storage.prune_remote(
+            target, prefix=args.prefix, match=args.match or "",
+            keep=args.keep, dry_run=args.dry_run,
+        )
+        verb = "将删除" if args.dry_run else "已删除"
+        for key in removed:
+            print(f"{verb} {key}")
+        print(f"共 {len(removed)} 个对象")
+        return 0
+    if args.storage_cmd == "verify":
+        target = pick(store.targets, args.ref, "存储")
+        key = args.key
+        if not key:
+            from pathlib import Path as _Path
+
+            fake = _Path(args.file)
+            key = storage.object_key(target, fake)
+            print(f"未指定 --key，按当前前缀推导：{key}")
+        digest = storage.verify_remote(target, args.file, key)
+        print(f"校验通过：{digest}")
+        return 0
     if args.storage_cmd == "rm":
         target = pick(store.targets, args.ref, "存储")
         store.remove(target.id)
@@ -482,6 +505,7 @@ def cmd_db(args: argparse.Namespace) -> int:
             schedule_hours=args.every_hours or 0,
             keep=args.keep,
             upload_to=args.upload or "",
+            remote_keep=args.remote_keep,
         )
         if args.ask_password:
             target.password = getpass.getpass("数据库密码（不回显）: ")
@@ -529,7 +553,12 @@ def cmd_db(args: argparse.Namespace) -> int:
                 dest = store.by_name(args.upload) or store.by_id(args.upload)
                 if dest is None:
                     return fail(f"找不到存储：{args.upload}")
-                remote = "，已上传 " + storage.upload(dest, path)
+                uri = storage.upload(dest, path)
+                remote = "，已上传 " + uri
+                if not args.no_verify:
+                    _, key = storage.parse_uri(uri)
+                    storage.verify_remote(dest, path, key)
+                    remote += "，校验通过"
         except Exception as exc:  # noqa: BLE001
             return fail(f"{type(exc).__name__}: {exc}")
         print(f"备份完成：{path}{remote}")
@@ -737,6 +766,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_storage.add_argument("--access-key", required=True)
     add_storage.add_argument("--prefix", default="opsmate")
     add_storage.set_defaults(func=cmd_storage)
+    prune_storage = storage_sub.add_parser("prune", help="按份数清理远端旧对象")
+    prune_storage.add_argument("ref")
+    prune_storage.add_argument("--prefix", required=True, help="对象前缀，如 opsmate/2026/11/")
+    prune_storage.add_argument("--match", help="只清理文件名包含该字符串的对象")
+    prune_storage.add_argument("--keep", type=int, required=True)
+    prune_storage.add_argument("--dry-run", action="store_true")
+    prune_storage.set_defaults(func=cmd_storage)
+    verify_storage = storage_sub.add_parser("verify", help="下载远端对象并比对 SHA-256")
+    verify_storage.add_argument("ref")
+    verify_storage.add_argument("file")
+    verify_storage.add_argument("--key", help="对象键；不填按当前前缀推导")
+    verify_storage.set_defaults(func=cmd_storage)
     rm_storage = storage_sub.add_parser("rm", help="删除存储")
     rm_storage.add_argument("ref")
     rm_storage.set_defaults(func=cmd_storage)
@@ -809,6 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--ssh-host", help="通过哪台 SSH 主机做隧道（主机名或 ID）")
     add.add_argument("--every-hours", type=int, default=0, help="自动备份间隔，0=关闭")
     add.add_argument("--upload", help="自动备份后上传到哪个存储（ops storage 名称）")
+    add.add_argument("--remote-keep", type=int, default=0, help="远端保留份数，0=不清理")
     add.add_argument("--keep", type=int, default=7, help="保留最近几份备份")
     add.set_defaults(func=cmd_db)
     for name, help_text in (("rm", "删除目标"), ("test", "测试连接"),
@@ -819,6 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
             item.add_argument("--out", help="输出目录")
             item.add_argument("--encrypt", action="store_true", help="用口令加密备份")
             item.add_argument("--upload", help="备份后上传到对象存储（名称）")
+            item.add_argument("--no-verify", action="store_true", help="上传后不做下载校验")
         item.set_defaults(func=cmd_db)
     restore = db_sub.add_parser("restore", help="覆盖式恢复")
     restore.add_argument("ref")

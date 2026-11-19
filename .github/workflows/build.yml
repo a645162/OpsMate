@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/Nuitka/Nuitka
+          key: nuitka-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: Sync (gui + build)
+        run: uv sync --python 3.12 --extra gui --extra build
+      - name: Build Nuitka (CLI + GUI)
+        run: uv run python packaging/build.py --all
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Build installer
+        run: makensis packaging/installer.nsi
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpsMate-windows
+          path: |
+            dist/OpsMate.dist/**
+            dist/ops.dist/**
+            dist/OpsMate-Setup-*.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y patchelf ccache
+      - name: Sync (gui + build)
+        run: uv sync --python 3.12 --extra gui --extra build
+      - name: Build Nuitka (CLI + GUI)
+        run: uv run python packaging/build.py --all
+      - name: Package tarball
+        run: tar -czf dist/OpsMate-linux-x86_64.tar.gz -C dist OpsMate.dist ops.dist
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpsMate-linux
+          path: dist/OpsMate-linux-x86_64.tar.gz
