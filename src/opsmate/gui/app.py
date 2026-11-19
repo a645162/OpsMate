@@ -240,6 +240,23 @@ class DbDialog(QDialog):
         self.ed_image = QLineEdit(target.image if target else "")
         self.ed_image.setPlaceholderText("mysql:8 / postgres:16")
 
+        self.cb_tunnel = QComboBox()
+        self.cb_tunnel.addItem("直连（不开隧道）", "")
+        for host in Inventory.load().hosts:
+            self.cb_tunnel.addItem(f"{host.name}（{host.user}@{host.host}）", host.id)
+        if target and target.ssh_host_id:
+            index = self.cb_tunnel.findData(target.ssh_host_id)
+            if index >= 0:
+                self.cb_tunnel.setCurrentIndex(index)
+
+        self.sp_hours = QSpinBox()
+        self.sp_hours.setRange(0, 168)
+        self.sp_hours.setSpecialValueText("关闭")
+        self.sp_hours.setValue(target.schedule_hours if target else 0)
+        self.sp_keep = QSpinBox()
+        self.sp_keep.setRange(1, 365)
+        self.sp_keep.setValue(target.keep if target else 7)
+
         form.addRow("名称", self.ed_name)
         form.addRow("类型", self.cb_engine)
         form.addRow("地址", self.ed_host)
@@ -249,6 +266,9 @@ class DbDialog(QDialog):
         form.addRow("数据库", self.ed_databases)
         form.addRow("客户端", self.cb_mode)
         form.addRow("Docker 镜像", self.ed_image)
+        form.addRow("SSH 隧道", self.cb_tunnel)
+        form.addRow("自动备份间隔", self.sp_hours)
+        form.addRow("保留份数", self.sp_keep)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
@@ -269,6 +289,9 @@ class DbDialog(QDialog):
             databases=[d.strip() for d in self.ed_databases.text().split(",") if d.strip()],
             client_mode=self.cb_mode.currentData(),
             image=self.ed_image.text().strip(),
+            ssh_host_id=self.cb_tunnel.currentData() or "",
+            schedule_hours=self.sp_hours.value(),
+            keep=self.sp_keep.value(),
         )
 
 
@@ -641,9 +664,9 @@ class MainWindow(QMainWindow):
         bar.addStretch(1)
         v.addLayout(bar)
 
-        self.tbl_db = QTableWidget(0, 6)
+        self.tbl_db = QTableWidget(0, 8)
         self.tbl_db.setHorizontalHeaderLabels(
-            ["名称", "类型", "地址", "用户", "范围", "客户端"]
+            ["名称", "类型", "地址", "用户", "范围", "客户端", "隧道", "自动备份"]
         )
         self.tbl_db.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_db.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -662,10 +685,15 @@ class MainWindow(QMainWindow):
         targets = self.catalog.targets
         self.tbl_db.setRowCount(len(targets))
         for row, target in enumerate(targets):
+            hosts = Inventory.load()
+            tunnel_host = hosts.by_id(target.ssh_host_id) if target.ssh_host_id else None
             values = [
                 target.name, target.engine, f"{target.host}:{target.port}", target.user,
                 "全部" if not target.databases else ",".join(target.databases),
                 target.client_mode,
+                tunnel_host.name if tunnel_host else "—",
+                f"每 {target.schedule_hours}h / 留 {target.keep} 份"
+                if target.schedule_hours else "—",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -735,7 +763,7 @@ class MainWindow(QMainWindow):
             return
         self.lbl_db.setText("恢复中…")
         run_async(
-            self, lambda: db.restore(target, path, confirm=True),
+            self, lambda: db.restore_with_safety(target, path, confirm=True),
             lambda msg: self.lbl_db.setText("✅ " + str(msg)),
             lambda m: self.lbl_db.setText("❌ " + m),
         )

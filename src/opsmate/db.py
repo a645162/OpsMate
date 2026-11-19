@@ -18,7 +18,8 @@ import tarfile
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,10 @@ class DbTarget:
     databases: list[str] = field(default_factory=list)   # 空 = 全部
     client_mode: str = "auto"                            # auto | local | docker
     image: str = ""
+    ssh_host_id: str = ""                                # 走哪台 SSH 主机做隧道（空=直连）
+    schedule_hours: int = 0                              # 自动备份间隔，0=关闭
+    keep: int = 7                                        # 保留最近几份
+    last_backup: str = ""                                # ISO 时间
     note: str = ""
     id: str = field(default_factory=new_id)
 
@@ -111,6 +116,98 @@ class DbCatalog:
             self.save()
             return True
         return False
+
+
+# --------------------------------------------------------------------- SSH 隧道
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_port(port: int, timeout: float = 10.0) -> None:
+    import socket
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.2)
+    raise DbError(f"SSH 隧道没起来（本地端口 {port} 连不上）")
+
+
+@contextmanager
+def tunnel(target: DbTarget, inventory: Any | None = None):
+    """需要时开一个 ssh -L 本地转发，yield 改写过 host/port 的 target。"""
+    if not target.ssh_host_id:
+        yield target
+        return
+
+
+    from landui_sdk.ssh import build_ssh_command, ssh_env
+
+    from opsmate.inventory import Inventory
+
+    inventory = inventory or Inventory.load()
+    host = inventory.by_id(target.ssh_host_id)
+    if host is None:
+        raise DbError(f"隧道主机不存在：{target.ssh_host_id}")
+
+    local_port = _free_port()
+    cmd = [
+        "ssh", "-N",
+        "-L", f"127.0.0.1:{local_port}:{target.host}:{target.port}",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+    ]
+    ssh_args = build_ssh_command(host.target())
+    # build_ssh_command 末尾是 user@host，把 -p 端口等选项接在前面
+    cmd += ssh_args[1:]
+    proc = subprocess.Popen(
+        cmd, env=ssh_env(host.target()),
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_port(local_port)
+        yield replace(target, host="127.0.0.1", port=local_port)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _via_tunnel(target: DbTarget) -> Any:
+    """上下文管理器的别名，便于测试替换。"""
+    return tunnel(target)
+
+
+def test_connection(target: DbTarget, timeout: float = 20) -> str:
+    with _via_tunnel(target) as scoped:
+        return _test_connection(scoped, timeout)
+
+
+def list_databases(target: DbTarget, timeout: float = 20) -> list[str]:
+    with _via_tunnel(target) as scoped:
+        return _list_databases(scoped, timeout)
+
+
+def backup(target: DbTarget, out_dir: Path | None = None) -> Path:
+    with _via_tunnel(target) as scoped:
+        path = _backup(scoped, out_dir)
+    target.last_backup = time.strftime("%Y-%m-%dT%H:%M:%S")
+    return path
+
+
+def restore(target: DbTarget, archive: str | Path, *, confirm: bool = False) -> str:
+    with _via_tunnel(target) as scoped:
+        return _restore(scoped, archive, confirm=confirm)
 
 
 # --------------------------------------------------------------------- 执行器
@@ -190,7 +287,7 @@ def _err(proc: subprocess.CompletedProcess) -> str:
 
 
 # --------------------------------------------------------------------- 查询
-def test_connection(target: DbTarget, timeout: float = 20) -> str:
+def _test_connection(target: DbTarget, timeout: float = 20) -> str:
     runner = resolve_runner(target)
     if target.engine == "mysql":
         cmd = runner.tool("mysql") + [
@@ -210,7 +307,7 @@ def test_connection(target: DbTarget, timeout: float = 20) -> str:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
-def list_databases(target: DbTarget, timeout: float = 20) -> list[str]:
+def _list_databases(target: DbTarget, timeout: float = 20) -> list[str]:
     runner = resolve_runner(target)
     if target.engine == "mysql":
         cmd = runner.tool("mysql") + [
@@ -240,7 +337,7 @@ def _slug(text: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "-" for c in text).strip("-") or "db"
 
 
-def backup(target: DbTarget, out_dir: Path | None = None) -> Path:
+def _backup(target: DbTarget, out_dir: Path | None = None) -> Path:
     runner = resolve_runner(target)
     out_dir = out_dir or (config.backups_dir() / "db")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -309,7 +406,7 @@ def _backup_gz(cmd: list[str], runner: Runner, path: Path) -> None:
 
 
 # --------------------------------------------------------------------- 恢复
-def restore(target: DbTarget, archive: str | Path, *, confirm: bool = False) -> str:
+def _restore(target: DbTarget, archive: str | Path, *, confirm: bool = False) -> str:
     """覆盖式恢复：会 DROP 已有对象再导入，务必先确认。"""
     if not confirm:
         raise DbError("恢复会覆盖现有数据，需要显式 confirm=True")
@@ -370,3 +467,87 @@ def _feed_gz(cmd: list[str], runner: Runner, archive: Path) -> None:
     code = proc.wait()
     if code != 0:
         raise DbError(err or f"恢复失败（退出码 {code}）")
+
+
+# --------------------------------------------------------------------- 保留/定时
+def _backup_dir() -> Path:
+    path = config.backups_dir() / "db"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _prefix(target: DbTarget) -> str:
+    return f"{_slug(target.name)}-{target.engine}-"
+
+
+def prune(target: DbTarget, keep: int | None = None, out_dir: Path | None = None) -> int:
+    """只保留最近 keep 份该目标的备份，返回删除数量。"""
+    keep = target.keep if keep is None else keep
+    if keep <= 0:
+        return 0
+    directory = out_dir or _backup_dir()
+    files = sorted(
+        (p for p in directory.glob(f"{_prefix(target)}*") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    removed = 0
+    for old in files[keep:]:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def is_due(target: DbTarget, now: float | None = None) -> bool:
+    if target.schedule_hours <= 0:
+        return False
+    if not target.last_backup:
+        return True
+    try:
+        last = time.mktime(time.strptime(target.last_backup, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return True
+    return (now or time.time()) - last >= target.schedule_hours * 3600
+
+
+def autobackup(*, force: bool = False, catalog: DbCatalog | None = None) -> list[tuple[str, str]]:
+    """给所有到期的目标做备份并清理旧文件；返回 [(目标名, 结果)]。"""
+    catalog = catalog or DbCatalog.load()
+    results: list[tuple[str, str]] = []
+    changed = False
+    for target in catalog.targets:
+        if not force and not is_due(target):
+            continue
+        try:
+            path = backup(target)
+            removed = prune(target)
+            target.last_backup = time.strftime("%Y-%m-%dT%H:%M:%S")
+            changed = True
+            extra = f"（清理 {removed} 份旧备份）" if removed else ""
+            results.append((target.name, f"{path}{extra}"))
+        except Exception as exc:  # noqa: BLE001 - 单个失败不影响其它
+            results.append((target.name, f"失败：{type(exc).__name__}: {exc}"))
+    if changed:
+        catalog.save()
+    return results
+
+
+def restore_with_safety(
+    target: DbTarget, archive: str | Path, *, confirm: bool = False
+) -> str:
+    """恢复前先给当前状态拍一份快照，失败了也能回头。"""
+    if not confirm:
+        raise DbError("恢复会覆盖现有数据，需要显式 confirm=True")
+    safety: Path | None = None
+    warning = ""
+    try:
+        safety = backup(target, out_dir=_backup_dir() / "pre-restore")
+    except Exception as exc:  # noqa: BLE001 - 库已经坏了也要允许恢复
+        warning = f"（当前状态快照失败：{type(exc).__name__}: {exc}）"
+    message = restore(target, archive, confirm=True)
+    if safety is not None:
+        return f"{message}；恢复前快照：{safety.name}"
+    return message + warning

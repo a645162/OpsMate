@@ -315,10 +315,12 @@ def cmd_db(args: argparse.Namespace) -> int:
 
     if args.db_cmd == "list":
         print_table(
-            ["ID", "名称", "类型", "地址", "用户", "范围", "模式"],
+            ["ID", "名称", "类型", "地址", "用户", "范围", "模式", "隧道", "自动"],
             [
                 [t.id, t.name, t.engine, f"{t.host}:{t.port}", t.user,
-                 "全部" if not t.databases else ",".join(t.databases), t.client_mode]
+                 "全部" if not t.databases else ",".join(t.databases), t.client_mode,
+                 t.ssh_host_id or "—",
+                 f"{t.schedule_hours}h/留{t.keep}" if t.schedule_hours else "—"]
                 for t in catalog.targets
             ],
         )
@@ -334,6 +336,9 @@ def cmd_db(args: argparse.Namespace) -> int:
             databases=[d.strip() for d in (args.databases or "").split(",") if d.strip()],
             client_mode=args.mode,
             image=args.image or "",
+            ssh_host_id=args.ssh_host or "",
+            schedule_hours=args.every_hours or 0,
+            keep=args.keep,
         )
         if args.ask_password:
             target.password = getpass.getpass("数据库密码（不回显）: ")
@@ -375,17 +380,85 @@ def cmd_db(args: argparse.Namespace) -> int:
         print(f"备份完成：{path}")
         return 0
 
+    if args.db_cmd == "autobackup":
+        results = db.autobackup(force=args.force)
+        if not results:
+            print("没有到期的备份任务")
+            return 0
+        for name, result in results:
+            print(f"{name}: {result}")
+        return 0
+
+    if args.db_cmd == "schedule":
+        try:
+            target = pick(catalog.targets, args.ref, "数据库")
+        except LookupError as exc:
+            return fail(str(exc))
+        target.schedule_hours = args.hours
+        target.keep = args.keep
+        catalog.upsert(target)
+        print(f"{target.name}: 每 {args.hours} 小时备份一次，保留 {args.keep} 份")
+        print(_schedule_hint(args.hours))
+        if args.install:
+            return _install_schedule(args.hours)
+        return 0
+
     if args.db_cmd == "restore":
         if not args.yes:
             return fail("恢复会覆盖现有数据，确认请加 --yes")
         try:
             target = pick(catalog.targets, args.ref, "数据库")
-            print(db.restore(target, args.file, confirm=True))
+            if args.no_safety:
+                print(db.restore(target, args.file, confirm=True))
+            else:
+                print(db.restore_with_safety(target, args.file, confirm=True))
         except Exception as exc:  # noqa: BLE001
             return fail(f"{type(exc).__name__}: {exc}")
         return 0
 
     return fail("未知子命令")
+
+
+def _schedule_hint(hours: int) -> str:
+    return (
+        "让它自动跑：\n"
+        f"  Linux:  ops db schedule <名称> --hours {hours} --install\n"
+        f"  或 cron: 0 */{max(hours, 1)} * * * {sys.executable} -m opsmate db autobackup\n"
+        f"  Windows: schtasks /Create /SC HOURLY /MO {max(hours, 1)} /TN OpsMateDBBackup "
+        f"/TR \"{sys.executable} -m opsmate db autobackup\""
+    )
+
+
+def _install_schedule(hours: int) -> int:
+    if sys.platform != "linux":
+        print("当前系统不支持自动安装，请用上面打印的计划任务命令。")
+        return 1
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    service = unit_dir / "opsmate-db-backup.service"
+    timer = unit_dir / "opsmate-db-backup.timer"
+    service.write_text(
+        "[Unit]\nDescription=OpsMate database backup\n\n"
+        "[Service]\nType=oneshot\n"
+        f"ExecStart={sys.executable} -m opsmate db autobackup\n",
+        "utf-8",
+    )
+    timer.write_text(
+        "[Unit]\nDescription=OpsMate database backup timer\n\n"
+        "[Timer]\nOnBootSec=5min\n"
+        f"OnUnitActiveSec={max(hours, 1)}h\nPersistent=true\n\n"
+        "[Install]\nWantedBy=timers.target\n",
+        "utf-8",
+    )
+    subprocess.call(["systemctl", "--user", "daemon-reload"], check=False)
+    code = subprocess.call(
+        ["systemctl", "--user", "enable", "--now", "opsmate-db-backup.timer"], check=False
+    )
+    if code == 0:
+        print("已安装 systemd 用户定时器：opsmate-db-backup.timer")
+    else:
+        print("安装失败，请手动执行：systemctl --user enable --now opsmate-db-backup.timer")
+    return code
 
 
 # --------------------------------------------------------------------- 解析器
@@ -487,6 +560,9 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--mode", default="auto", choices=["auto", "local", "docker"])
     add.add_argument("--image", help="docker 客户端镜像，如 mysql:8 / postgres:16")
     add.add_argument("--ask-password", action="store_true")
+    add.add_argument("--ssh-host", help="通过哪台 SSH 主机做隧道（主机名或 ID）")
+    add.add_argument("--every-hours", type=int, default=0, help="自动备份间隔，0=关闭")
+    add.add_argument("--keep", type=int, default=7, help="保留最近几份备份")
     add.set_defaults(func=cmd_db)
     for name, help_text in (("rm", "删除目标"), ("test", "测试连接"),
                             ("databases", "列出库"), ("backup", "备份")):
@@ -499,7 +575,19 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("ref")
     restore.add_argument("file")
     restore.add_argument("--yes", action="store_true", help="确认覆盖")
+    restore.add_argument("--no-safety", action="store_true", help="恢复前不拍快照")
     restore.set_defaults(func=cmd_db)
+
+    autobackup = db_sub.add_parser("autobackup", help="执行到期的自动备份（给定时器调用）")
+    autobackup.add_argument("--force", action="store_true", help="忽略间隔，全部备份")
+    autobackup.set_defaults(func=cmd_db)
+
+    schedule = db_sub.add_parser("schedule", help="设置自动备份间隔/保留份数")
+    schedule.add_argument("ref")
+    schedule.add_argument("--hours", type=int, required=True)
+    schedule.add_argument("--keep", type=int, default=7)
+    schedule.add_argument("--install", action="store_true", help="安装 systemd 用户定时器")
+    schedule.set_defaults(func=cmd_db)
 
     return parser
 

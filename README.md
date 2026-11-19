@@ -16,7 +16,7 @@
 | SSH 密钥 | 列出、生成（ed25519/rsa/ecdsa，可带口令）、复制公钥、装到服务器、**上传到 GitHub**、删除 |
 | ~/.ssh/config | 查看、编辑、**每次写入自动备份**、把清单同步进托管块（块外内容原样保留） |
 | 终端集成 | 导出 / 直接写入 **Tabby** 和 **Windows Terminal** 的 profile（写前备份） |
-| 数据库 | **MySQL / PostgreSQL 全库备份与覆盖恢复**；本机客户端或 Docker 模式 |
+| 数据库 | **MySQL / PostgreSQL 全库备份与覆盖恢复**；本机客户端或 Docker 模式；**SSH 隧道**、**定时备份 + 保留策略**、**恢复前自动快照** |
 | 蓝队云 | 服务器列表、开关机、防火墙（通过 LanduiSDK，见其 README） |
 
 ## 快速开始
@@ -49,7 +49,7 @@ ops hosts list|add|rm|import      # 本地主机清单
 ops keys list|new|show|install|github|delete
 ops config show|backup|sync|edit  # ~/.ssh/config（自动备份）
 ops export ssh|tabby|wt [--apply]
-ops db list|add|rm|test|databases|backup|restore
+ops db list|add|rm|test|databases|backup|restore|schedule|autobackup
 ops ssh <主机 ID 或名称>
 ```
 

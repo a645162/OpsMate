@@ -39,7 +39,7 @@ src/opsmate/
   sshkeys.py     密钥列出/生成/装公钥/传 GitHub
   sshconfig.py   ~/.ssh/config 解析、托管块、备份、原子写入
   terminals.py   Tabby / Windows Terminal 片段与合并
-  db.py          MySQL/PostgreSQL 备份恢复（local 或 docker runner）
+  db.py          MySQL/PostgreSQL 备份恢复（local/docker runner、SSH 隧道、定时/保留、恢复前快照）
   config.py      跨平台路径与私有 JSON
   doctor.py      自检（纯函数返回 Check，不 print）
   gui/app.py     PySide6；线程用 run_async，禁止主线程发请求
@@ -64,5 +64,8 @@ uv run python scripts/db_docker_test.py
 - 新增外部配置写入：先备份，再写，权限 0600（`config.write_private`）。
 - 新增命令：`build_parser()` 注册 + `cmd_xxx(args) -> int` + 离线测试。
 - 数据库新增引擎：实现 backup/restore/test/list 四件事，密码走环境变量。
+- 恢复类操作默认走 `restore_with_safety()`；新增入口不要绕过它（除非显式 `--no-safety`）。
+- 定时任务只调用 `db.autobackup()`，它会按 `schedule_hours` 判断到期并 `prune(keep)`；
+  不要在别处重复实现清理逻辑。
 - GUI 操作耗时内容（备份/恢复/导入）一律 `run_async`，结果回 UI 线程。
 - 文案中文；命令、路径、报错原文保持。

@@ -85,7 +85,7 @@ def test_mysql(tmp: Path) -> None:
     exec_sql("DROP DATABASE demo;")
 
     print("→ 覆盖恢复…")
-    print("  ", db.restore(target, archive, confirm=True))
+    print("  ", db.restore_with_safety(target, archive, confirm=True))
     after = exec_sql("SELECT COUNT(*) FROM demo.t;")
     print(f"   恢复前行数输出 {before!r}，恢复后 {after!r}")
     assert "2" in after, after
@@ -129,7 +129,7 @@ def test_postgres(tmp: Path) -> None:
     psql("DROP TABLE t;")
 
     print("→ 覆盖恢复…")
-    print("  ", db.restore(target, archive, confirm=True))
+    print("  ", db.restore_with_safety(target, archive, confirm=True))
     count = psql("SELECT COUNT(*) FROM t;")
     print("   恢复后：", " ".join(count.split()))
     assert "2" in count, count
