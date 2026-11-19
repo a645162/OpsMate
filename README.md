@@ -16,7 +16,9 @@
 | SSH 密钥 | 列出、生成（ed25519/rsa/ecdsa，可带口令）、复制公钥、装到服务器、**上传到 GitHub**、删除 |
 | ~/.ssh/config | 查看、编辑、**每次写入自动备份**、把清单同步进托管块（块外内容原样保留） |
 | 终端集成 | 导出 / 直接写入 **Tabby** 和 **Windows Terminal** 的 profile（写前备份） |
-| 数据库 | **MySQL / PostgreSQL 全库备份与覆盖恢复**；本机客户端或 Docker 模式；**SSH 隧道**、**定时备份 + 保留策略**、**恢复前自动快照** |
+| 数据库 | **MySQL / PostgreSQL 全库备份与覆盖恢复**；本机客户端或 Docker 模式；**SSH 隧道（连接复用）**、**定时备份 + 保留**、**恢复前快照**、**AES-256 加密备份**、**恢复演练报告** |
+| DNS 解析 | **Cloudflare** 与 **阿里云解析**：域名列表、记录增删改查（CLI + GUI） |
+| 打包 | **Nuitka** 独立程序（Windows/Linux）+ **NSIS** 安装包脚本 |
 | 蓝队云 | 服务器列表、开关机、防火墙（通过 LanduiSDK，见其 README） |
 
 ## 快速开始
@@ -49,7 +51,11 @@ ops hosts list|add|rm|import      # 本地主机清单
 ops keys list|new|show|install|github|delete
 ops config show|backup|sync|edit  # ~/.ssh/config（自动备份）
 ops export ssh|tabby|wt [--apply]
-ops db list|add|rm|test|databases|backup|restore|schedule|autobackup
+ops db list|add|rm|test|databases|backup|restore|drill|schedule|autobackup
+ops dns creds list|add|rm
+ops dns zones <凭据>
+ops dns records <凭据> <域名>
+ops dns add|update|rm ...
 ops ssh <主机 ID 或名称>
 ```
 
@@ -75,6 +81,36 @@ ops ssh <主机 ID 或名称>
 ```
 
 备份文件默认在 `~/.config/opsmate/backups/db/`。
+
+## DNS 解析
+
+```bash
+ops dns creds add cf --provider cloudflare     # 粘贴 API Token（不回显）
+ops dns creds add ali --provider aliyun        # AccessKeyId + Secret
+ops dns zones cf
+ops dns records cf example.com
+ops dns add cf example.com --name www --type A --content 203.0.113.10 --proxied
+ops dns update cf example.com <record_id> --content 203.0.113.11
+ops dns rm cf example.com <record_id> --yes
+```
+
+* Cloudflare 走 API Token；阿里云走 Aliyun DNS RPC（HMAC-SHA1 签名，已含在代码里）
+* 凭据存 `~/.config/opsmate/dns.json`（0600），建议用只含 DNS 权限的 RAM 子账号
+* GUI「DNS」页签：选凭据 → 选域名 → 记录增删，支持代理开关与线路
+
+## 打包（Nuitka + NSIS）
+
+```bash
+uv sync --extra gui --extra build
+uv run python packaging/build.py --all     # CLI + GUI
+```
+
+产物：`dist/ops.dist`、`dist/OpsMate.dist`。
+Windows 安装包：`makensis packaging\installer.nsi` → `dist\OpsMate-Setup-*.exe`。
+详见 [`packaging/README.md`](packaging/README.md)。
+
+> 已在 Linux 实测：CLI 与 GUI 的 Nuitka standalone 均构建成功并可运行；
+> Windows 的构建/安装包脚本已就绪，待你在 Windows 上验证。
 
 ## 文件位置
 

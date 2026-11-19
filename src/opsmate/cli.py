@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from opsmate import APP_NAME, APP_NAME_ZH, __version__
 
@@ -307,6 +308,117 @@ def cmd_export(args: argparse.Namespace) -> int:
     return fail("未知子命令")
 
 
+def _backup_passphrase(label: str = "备份口令") -> str:
+    env = os.environ.get("OPSMATE_BACKUP_PASSPHRASE")
+    if env:
+        return env
+    return getpass.getpass(f"{label}（留空=不加密）: ")
+
+
+# --------------------------------------------------------------------- DNS
+def cmd_dns(args: argparse.Namespace) -> int:
+    from opsmate import dns
+
+    store = dns.DnsStore.load()
+
+    if args.dns_cmd == "creds":
+        if args.creds_cmd == "list":
+            print_table(
+                ["ID", "名称", "提供商", "凭据"],
+                [
+                    [c.id, c.name, c.provider,
+                     "token" if c.provider == "cloudflare" else c.access_key_id]
+                    for c in store.credentials
+                ],
+            )
+            return 0
+        if args.creds_cmd == "add":
+            cred = dns.DnsCredential(name=args.name, provider=args.provider)
+            if args.provider == "cloudflare":
+                cred.token = getpass.getpass("Cloudflare API Token: ")
+            else:
+                cred.access_key_id = input("AccessKeyId: ").strip()
+                cred.access_key_secret = getpass.getpass("AccessKeySecret: ")
+            store.upsert(cred)
+            print(f"已保存凭据：{cred.id} {cred.label}")
+            return 0
+        if args.creds_cmd == "rm":
+            cred = pick(store.credentials, args.ref, "凭据")
+            store.remove(cred.id)
+            print(f"已删除 {cred.name}")
+            return 0
+
+    try:
+        cred = pick(store.credentials, args.cred, "凭据")
+        provider = dns.provider_for(cred)
+        zones = provider.zones()
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"{type(exc).__name__}: {exc}")
+
+    if args.dns_cmd == "zones":
+        print_table(["ID", "域名"], [[z.id, z.name] for z in zones])
+        return 0
+
+    try:
+        zone = pick(zones, args.zone, "域名")
+    except LookupError as exc:
+        return fail(str(exc))
+
+    try:
+        if args.dns_cmd == "records":
+            records = provider.records(zone.name if cred.provider == "aliyun" else zone.id)
+            rows = [
+                [r.id, r.name, r.type, r.content, str(r.ttl),
+                 "已代理" if r.proxied else (r.line or "-"), str(r.priority or "")]
+                for r in records
+            ]
+            print_table(
+                ["ID", "名称", "类型", "值", "TTL", "线路/代理", "优先级"], rows
+            )
+            return 0
+
+        if args.dns_cmd == "add":
+            if cred.provider == "cloudflare":
+                provider.add(zone.id, name=args.name, type=args.type,
+                             content=args.content, ttl=args.ttl,
+                             proxied=args.proxied, priority=args.priority)
+            else:
+                provider.add(zone.name, name=args.name, type=args.type,
+                             content=args.content, ttl=args.ttl,
+                             line=args.line, priority=args.priority)
+            print("已添加记录")
+            return 0
+
+        if args.dns_cmd == "update":
+            fields: dict[str, Any] = {}
+            if cred.provider == "cloudflare":
+                if args.name: fields["name"] = args.name
+                if args.type: fields["type"] = args.type
+                if args.content: fields["content"] = args.content
+                if args.ttl: fields["ttl"] = args.ttl
+                if args.proxied is not None: fields["proxied"] = args.proxied
+                provider.update(zone.id, args.record_id, **fields)
+            else:
+                if args.name: fields["RR"] = args.name
+                if args.type: fields["Type"] = args.type
+                if args.content: fields["Value"] = args.content
+                if args.ttl: fields["TTL"] = args.ttl
+                if args.line: fields["Line"] = args.line
+                provider.update(args.record_id, **fields)
+            print("已更新记录")
+            return 0
+
+        if args.dns_cmd == "rm":
+            if not args.yes:
+                return fail("删除解析记录确认请加 --yes")
+            provider.delete(zone.id if cred.provider == "cloudflare" else args.record_id)
+            print("已删除记录")
+            return 0
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"{type(exc).__name__}: {exc}")
+    return fail("未知子命令")
+
+
 # --------------------------------------------------------------------- 数据库
 def cmd_db(args: argparse.Namespace) -> int:
     from opsmate import db
@@ -374,10 +486,27 @@ def cmd_db(args: argparse.Namespace) -> int:
     if args.db_cmd == "backup":
         try:
             target = pick(catalog.targets, args.ref, "数据库")
-            path = db.backup(target, Path(args.out) if args.out else None)
+            password = _backup_passphrase() if args.encrypt else None
+            path = db.backup(
+                target, Path(args.out) if args.out else None, password=password or None
+            )
         except Exception as exc:  # noqa: BLE001
             return fail(f"{type(exc).__name__}: {exc}")
         print(f"备份完成：{path}")
+        return 0
+
+    if args.db_cmd == "drill":
+        try:
+            target = pick(catalog.targets, args.ref, "数据库")
+            from opsmate import crypto
+
+            password = None
+            if crypto.is_encrypted(args.file):
+                password = getpass.getpass("这是加密备份，输入口令: ")
+            report = db.drill(target, args.file, password=password)
+        except Exception as exc:  # noqa: BLE001
+            return fail(f"{type(exc).__name__}: {exc}")
+        print(f"演练完成，报告：{report}")
         return 0
 
     if args.db_cmd == "autobackup":
@@ -408,10 +537,19 @@ def cmd_db(args: argparse.Namespace) -> int:
             return fail("恢复会覆盖现有数据，确认请加 --yes")
         try:
             target = pick(catalog.targets, args.ref, "数据库")
+            from opsmate import crypto
+
+            password = None
+            if crypto.is_encrypted(args.file):
+                password = getpass.getpass("这是加密备份，输入口令: ")
             if args.no_safety:
-                print(db.restore(target, args.file, confirm=True))
+                print(db.restore(target, args.file, confirm=True, password=password))
             else:
-                print(db.restore_with_safety(target, args.file, confirm=True))
+                print(
+                    db.restore_with_safety(
+                        target, args.file, confirm=True, password=password
+                    )
+                )
         except Exception as exc:  # noqa: BLE001
             return fail(f"{type(exc).__name__}: {exc}")
         return 0
@@ -547,6 +685,58 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--apply", action="store_true", help="直接合并到客户端配置")
         item.set_defaults(func=cmd_export)
 
+    dns_parser = sub.add_parser("dns", help="Cloudflare / 阿里云 DNS 解析")
+    dns_sub = dns_parser.add_subparsers(dest="dns_cmd", required=True)
+    creds = dns_sub.add_parser("creds", help="管理 DNS 凭据")
+    creds_sub = creds.add_subparsers(dest="creds_cmd", required=True)
+    creds_sub.add_parser("list", help="列出凭据").set_defaults(func=cmd_dns)
+    add_cred = creds_sub.add_parser("add", help="添加凭据")
+    add_cred.add_argument("name")
+    add_cred.add_argument("--provider", default="cloudflare", choices=["cloudflare", "aliyun"])
+    add_cred.set_defaults(func=cmd_dns)
+    rm_cred = creds_sub.add_parser("rm", help="删除凭据")
+    rm_cred.add_argument("ref")
+    rm_cred.set_defaults(func=cmd_dns)
+
+    for name, help_text in (("zones", "列出域名"), ("records", "列出解析")):
+        item = dns_sub.add_parser(name, help=help_text)
+        item.add_argument("cred")
+        if name == "records":
+            item.add_argument("zone")
+        item.set_defaults(func=cmd_dns)
+
+    add_rec = dns_sub.add_parser("add", help="添加解析")
+    add_rec.add_argument("cred")
+    add_rec.add_argument("zone")
+    add_rec.add_argument("--name", required=True, help="主机记录，如 www / @")
+    add_rec.add_argument("--type", default="A")
+    add_rec.add_argument("--content", required=True)
+    add_rec.add_argument("--ttl", type=int, default=600)
+    add_rec.add_argument("--proxied", action="store_true", help="Cloudflare 代理")
+    add_rec.add_argument("--line", default="default", help="阿里云线路")
+    add_rec.add_argument("--priority", type=int)
+    add_rec.set_defaults(func=cmd_dns)
+
+    upd_rec = dns_sub.add_parser("update", help="修改解析")
+    upd_rec.add_argument("cred")
+    upd_rec.add_argument("zone")
+    upd_rec.add_argument("record_id")
+    upd_rec.add_argument("--name")
+    upd_rec.add_argument("--type")
+    upd_rec.add_argument("--content")
+    upd_rec.add_argument("--ttl", type=int)
+    upd_rec.add_argument("--proxied", dest="proxied", action="store_true", default=None)
+    upd_rec.add_argument("--no-proxied", dest="proxied", action="store_false")
+    upd_rec.add_argument("--line")
+    upd_rec.set_defaults(func=cmd_dns)
+
+    rm_rec = dns_sub.add_parser("rm", help="删除解析")
+    rm_rec.add_argument("cred")
+    rm_rec.add_argument("zone")
+    rm_rec.add_argument("record_id")
+    rm_rec.add_argument("--yes", action="store_true")
+    rm_rec.set_defaults(func=cmd_dns)
+
     database = sub.add_parser("db", help="MySQL / PostgreSQL 备份与恢复")
     db_sub = database.add_subparsers(dest="db_cmd", required=True)
     db_sub.add_parser("list", help="列出数据库目标").set_defaults(func=cmd_db)
@@ -570,6 +760,7 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("ref")
         if name == "backup":
             item.add_argument("--out", help="输出目录")
+            item.add_argument("--encrypt", action="store_true", help="用口令加密备份")
         item.set_defaults(func=cmd_db)
     restore = db_sub.add_parser("restore", help="覆盖式恢复")
     restore.add_argument("ref")
@@ -577,6 +768,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--yes", action="store_true", help="确认覆盖")
     restore.add_argument("--no-safety", action="store_true", help="恢复前不拍快照")
     restore.set_defaults(func=cmd_db)
+
+    drill = db_sub.add_parser("drill", help="恢复演练（快照→恢复→校验→报告）")
+    drill.add_argument("ref")
+    drill.add_argument("file")
+    drill.set_defaults(func=cmd_db)
 
     autobackup = db_sub.add_parser("autobackup", help="执行到期的自动备份（给定时器调用）")
     autobackup.add_argument("--force", action="store_true", help="忽略间隔，全部备份")

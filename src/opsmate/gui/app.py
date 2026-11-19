@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from opsmate import __version__, config, db, sshconfig, sshkeys, terminals
+from opsmate import __version__, config, crypto, db, dns, sshconfig, sshkeys, terminals
 from opsmate.inventory import HostEntry, Inventory
 
 
@@ -295,6 +296,55 @@ class DbDialog(QDialog):
         )
 
 
+class DnsRecordDialog(QDialog):
+    def __init__(self, provider: str, parent=None):
+        super().__init__(parent)
+        self.provider = provider
+        self.setWindowTitle("添加解析记录")
+        self.setMinimumWidth(440)
+        form = QFormLayout(self)
+        self.ed_name = QLineEdit("@")
+        self.cb_type = QComboBox()
+        self.cb_type.addItems(["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV"])
+        self.ed_content = QLineEdit()
+        self.ed_content.setPlaceholderText("IP / 目标域名 / 文本")
+        self.sp_ttl = QSpinBox()
+        self.sp_ttl.setRange(1, 604800)
+        self.sp_ttl.setValue(600)
+        self.chk_proxied = QCheckBox("Cloudflare 代理（橙云）")
+        self.ed_line = QLineEdit("default")
+        self.ed_line.setPlaceholderText("阿里云线路，默认 default")
+
+        form.addRow("主机记录", self.ed_name)
+        form.addRow("类型", self.cb_type)
+        form.addRow("值", self.ed_content)
+        form.addRow("TTL", self.sp_ttl)
+        if provider == "cloudflare":
+            form.addRow("", self.chk_proxied)
+        else:
+            form.addRow("线路", self.ed_line)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("添加")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        form.addRow(buttons)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+    def values(self) -> dict:
+        base = {
+            "name": self.ed_name.text().strip() or "@",
+            "type": self.cb_type.currentText(),
+            "content": self.ed_content.text().strip(),
+            "ttl": self.sp_ttl.value(),
+        }
+        if self.provider == "cloudflare":
+            base["proxied"] = self.chk_proxied.isChecked()
+        else:
+            base["line"] = self.ed_line.text().strip() or "default"
+        return base
+
+
 # --------------------------------------------------------------------- 主窗口
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -310,11 +360,13 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_config_tab(), "SSH 配置")
         tabs.addTab(self._build_export_tab(), "导出")
         tabs.addTab(self._build_db_tab(), "数据库")
+        tabs.addTab(self._build_dns_tab(), "DNS")
 
         self.statusBar().showMessage("就绪")
         self.reload_hosts()
         self.reload_keys()
         self.reload_db()
+        self.reload_dns()
 
     # ------------------------------------------------------------------ 主机
     def _build_hosts_tab(self) -> QWidget:
@@ -657,6 +709,7 @@ class MainWindow(QMainWindow):
             ("测试连接", self.test_db),
             ("备份", self.backup_db),
             ("恢复（覆盖）", self.restore_db),
+            ("恢复演练", self.drill_db),
         ):
             btn = QPushButton(text)
             btn.clicked.connect(slot)
@@ -713,6 +766,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             self.catalog.upsert(dlg.value())
             self.reload_db()
+        self.reload_dns()
 
     def delete_db(self) -> None:
         target = self._selected_db()
@@ -722,6 +776,7 @@ class MainWindow(QMainWindow):
             return
         self.catalog.remove(target.id)
         self.reload_db()
+        self.reload_dns()
 
     def test_db(self) -> None:
         target = self._selected_db()
@@ -738,9 +793,16 @@ class MainWindow(QMainWindow):
         target = self._selected_db()
         if target is None:
             return
+        from PySide6.QtWidgets import QInputDialog
+
+        password, ok = QInputDialog.getText(
+            self, "备份", "加密口令（留空=不加密）：", QLineEdit.Password
+        )
+        if not ok:
+            return
         self.lbl_db.setText("备份中…（大库可能较久）")
         run_async(
-            self, lambda: db.backup(target),
+            self, lambda: db.backup(target, password=password or None),
             lambda path: self.lbl_db.setText(f"✅ 备份完成：{path}"),
             lambda m: self.lbl_db.setText("❌ " + m),
         )
@@ -761,13 +823,199 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         ) != QMessageBox.Yes:
             return
+        from PySide6.QtWidgets import QInputDialog
+
+        password = None
+        if crypto.is_encrypted(path):
+            password, ok = QInputDialog.getText(
+                self, "加密备份", "输入备份口令：", QLineEdit.Password
+            )
+            if not ok:
+                return
         self.lbl_db.setText("恢复中…")
         run_async(
-            self, lambda: db.restore_with_safety(target, path, confirm=True),
+            self, lambda: db.restore_with_safety(
+                target, path, confirm=True, password=password
+            ),
             lambda msg: self.lbl_db.setText("✅ " + str(msg)),
             lambda m: self.lbl_db.setText("❌ " + m),
         )
 
+    def drill_db(self) -> None:
+        target = self._selected_db()
+        if target is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要演练的备份", str(config.backups_dir() / "db"),
+            "备份 (*.sql.gz *.tar.gz *.enc)",
+        )
+        if not path:
+            return
+        from PySide6.QtWidgets import QInputDialog
+
+        password = None
+        if crypto.is_encrypted(path):
+            password, ok = QInputDialog.getText(
+                self, "加密备份", "输入备份口令：", QLineEdit.Password
+            )
+            if not ok:
+                return
+        self.lbl_db.setText("演练中：快照 → 恢复 → 校验…")
+        run_async(
+            self, lambda: db.drill(target, path, password=password),
+            lambda report: self.lbl_db.setText(f"✅ 演练完成，报告：{report}"),
+            lambda m: self.lbl_db.setText("❌ " + m),
+        )
+
+
+    # ---------------------------------------------------------------- DNS
+    def _build_dns_tab(self) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("凭据"))
+        self.cb_dns_cred = QComboBox()
+        self.cb_dns_cred.setMinimumWidth(180)
+        bar.addWidget(self.cb_dns_cred)
+        bar.addWidget(QLabel("域名"))
+        self.cb_dns_zone = QComboBox()
+        self.cb_dns_zone.setMinimumWidth(220)
+        bar.addWidget(self.cb_dns_zone)
+        btn_refresh = QPushButton("刷新")
+        btn_add = QPushButton("添加记录")
+        btn_del = QPushButton("删除记录")
+        for b in (btn_refresh, btn_add, btn_del):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        v.addLayout(bar)
+
+        self.tbl_dns = QTableWidget(0, 6)
+        self.tbl_dns.setHorizontalHeaderLabels(
+            ["名称", "类型", "值", "TTL", "线路/代理", "状态"]
+        )
+        self.tbl_dns.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_dns.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl_dns.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_dns.setAlternatingRowColors(True)
+        v.addWidget(self.tbl_dns, 1)
+
+        self.lbl_dns = QLabel("")
+        self.lbl_dns.setWordWrap(True)
+        self.lbl_dns.setStyleSheet("color:#666")
+        v.addWidget(self.lbl_dns)
+
+        self.cb_dns_cred.currentIndexChanged.connect(lambda _i: self._dns_load_zones())
+        self.cb_dns_zone.currentIndexChanged.connect(lambda _i: self._dns_load_records())
+        btn_refresh.clicked.connect(self.reload_dns)
+        btn_add.clicked.connect(self._dns_add)
+        btn_del.clicked.connect(self._dns_delete)
+        return page
+
+    def reload_dns(self) -> None:
+        self.dns_store = dns.DnsStore.load()
+        self.cb_dns_cred.blockSignals(True)
+        self.cb_dns_cred.clear()
+        for cred in self.dns_store.credentials:
+            self.cb_dns_cred.addItem(cred.label, cred.id)
+        self.cb_dns_cred.blockSignals(False)
+        if self.cb_dns_cred.count():
+            self._dns_load_zones()
+        else:
+            self.lbl_dns.setText(
+                "还没有 DNS 凭据：ops dns creds add <名称> --provider cloudflare|aliyun"
+            )
+
+    def _dns_cred(self) -> dns.DnsCredential | None:
+        cred_id = self.cb_dns_cred.currentData()
+        return self.dns_store.by_id(cred_id) if cred_id else None
+
+    def _dns_provider(self):
+        cred = self._dns_cred()
+        return (cred, dns.provider_for(cred)) if cred else (None, None)
+
+    def _dns_zone(self) -> dns.Zone | None:
+        index = self.cb_dns_zone.currentIndex()
+        return self.dns_zones[index] if 0 <= index < len(getattr(self, "dns_zones", [])) else None
+
+    def _dns_load_zones(self) -> None:
+        _cred, provider = self._dns_provider()
+        if not provider:
+            return
+        self.lbl_dns.setText("读取域名…")
+
+        def done(zones):
+            self.dns_zones = zones
+            self.cb_dns_zone.blockSignals(True)
+            self.cb_dns_zone.clear()
+            for zone in zones:
+                self.cb_dns_zone.addItem(zone.name, zone.id)
+            self.cb_dns_zone.blockSignals(False)
+            self.lbl_dns.setText(f"{len(zones)} 个域名")
+            self._dns_load_records()
+
+        run_async(self, provider.zones, done, lambda m: self.lbl_dns.setText("❌ " + m))
+
+    def _dns_load_records(self) -> None:
+        cred, provider = self._dns_provider()
+        zone = self._dns_zone()
+        if not provider or not zone:
+            return
+        key = zone.name if cred.provider == "aliyun" else zone.id
+        run_async(
+            self, lambda: provider.records(key),
+            self._dns_fill_records,
+            lambda m: self.lbl_dns.setText("❌ " + m),
+        )
+
+    def _dns_fill_records(self, records) -> None:
+        self.dns_records = records
+        self.tbl_dns.setRowCount(len(records))
+        for row, record in enumerate(records):
+            values = [
+                record.name, record.type, record.content, str(record.ttl),
+                "已代理" if record.proxied else (record.line or "-"),
+                record.status or "",
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.UserRole, record.id)
+                self.tbl_dns.setItem(row, col, item)
+        self.lbl_dns.setText(f"{len(records)} 条解析")
+
+    def _dns_add(self) -> None:
+        cred, provider = self._dns_provider()
+        zone = self._dns_zone()
+        if not provider or not zone:
+            return
+        dlg = DnsRecordDialog(cred.provider, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        values = dlg.values()
+        try:
+            if cred.provider == "cloudflare":
+                provider.add(zone.id, **values)
+            else:
+                provider.add(zone.name, **values)
+        except Exception as exc:  # noqa: BLE001
+            err_box(self, f"{type(exc).__name__}: {exc}")
+            return
+        self._dns_load_records()
+
+    def _dns_delete(self) -> None:
+        _cred, provider = self._dns_provider()
+        zone = self._dns_zone()
+        rows = self.tbl_dns.selectionModel().selectedRows()
+        if not provider or not zone or not rows:
+            return
+        record_id = self.tbl_dns.item(rows[0].row(), 0).data(Qt.UserRole)
+        if QMessageBox.question(self, "删除解析", f"删除记录 {record_id}？") != QMessageBox.Yes:
+            return
+        try:
+            provider.delete(record_id)
+        except Exception as exc:  # noqa: BLE001
+            err_box(self, f"{type(exc).__name__}: {exc}")
+            return
+        self._dns_load_records()
 
 def main() -> int:
     app = QApplication(sys.argv)

@@ -49,6 +49,10 @@ def db_targets_path() -> Path:
     return home() / "databases.json"
 
 
+def dns_credentials_path() -> Path:
+    return home() / "dns.json"
+
+
 def backups_dir() -> Path:
     path = home() / "backups"
     path.mkdir(parents=True, exist_ok=True)

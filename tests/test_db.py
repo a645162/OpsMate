@@ -129,8 +129,8 @@ def test_autobackup_runs_due_only(tmp_path, monkeypatch):
 
 def test_restore_with_safety_order(tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(db, "backup", lambda target, out_dir=None: (calls.append("backup"), tmp_path / "safe.sql.gz")[1])
-    monkeypatch.setattr(db, "restore", lambda target, archive, confirm=False: (calls.append("restore"), "ok")[1])
+    monkeypatch.setattr(db, "backup", lambda target, out_dir=None, **kw: (calls.append("backup"), tmp_path / "safe.sql.gz")[1])
+    monkeypatch.setattr(db, "restore", lambda target, archive, confirm=False, **kw: (calls.append("restore"), "ok")[1])
     message = db.restore_with_safety(db.DbTarget(name="x"), "a.sql.gz", confirm=True)
     assert calls == ["backup", "restore"]
     assert "恢复前快照" in message
@@ -170,3 +170,57 @@ def test_tunnel_rewrites_target(monkeypatch):
         assert scoped.port == 45678
     assert any("127.0.0.1:45678:10.0.0.9:3306" in part for part in holder["cmd"])
     assert holder["env"] is not None
+
+
+def test_tunnel_pool_reuses(monkeypatch):
+    from opsmate.inventory import HostEntry, Inventory
+
+    host = HostEntry(name="jump", host="203.0.113.5", port=2222, user="ops")
+    monkeypatch.setattr(Inventory, "load", classmethod(lambda cls: Inventory(hosts=[host])))
+    monkeypatch.setattr(db, "_free_port", lambda: 45678)
+    monkeypatch.setattr(db, "_wait_port", lambda port, timeout=10: None)
+
+    spawned = []
+
+    class Proc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(cmd, **kwargs):
+        spawned.append(cmd)
+        return Proc()
+
+    monkeypatch.setattr(db.subprocess, "Popen", fake_popen)
+    db.close_tunnels()
+    target = db.DbTarget(name="x", host="10.0.0.9", ssh_host_id=host.id)
+    with db.tunnel(target) as first, db.tunnel(target) as second:
+        assert first.port == second.port
+    assert len(spawned) == 1
+    db.close_tunnels()
+
+
+def test_drill_writes_report(tmp_path, monkeypatch):
+    from opsmate import config
+
+    monkeypatch.setenv(config.HOME_ENV, str(tmp_path / "home"))
+    target = db.DbTarget(name="demo", databases=["demo"])
+    monkeypatch.setattr(db, "backup", lambda *a, **k: tmp_path / "safe.sql.gz")
+    monkeypatch.setattr(db, "restore", lambda *a, **k: "ok")
+    monkeypatch.setattr(db, "test_connection", lambda *a, **k: "MySQL 8.0")
+    monkeypatch.setattr(db, "list_databases", lambda *a, **k: ["demo"])
+    monkeypatch.setattr(db, "_table_counts", lambda *a, **k: {"demo": 3})
+
+    report = db.drill(target, "backup.sql.gz")
+    text = report.read_text("utf-8")
+    assert "恢复演练报告" in text
+    assert "✅ 恢复成功" in text
+    assert "| demo | 3 |" in text

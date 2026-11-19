@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from opsmate import db  # noqa: E402
+from opsmate import db
 
 MYSQL_PORT = 33306
 PG_PORT = 35432
@@ -59,12 +59,12 @@ def test_mysql(tmp: Path) -> None:
         return subprocess.run(
             ["docker", "exec", name, "mysql", "-uroot", f"-p{PASSWORD}",
              "-N", "-B", "-e", "SELECT 1;"],
-            capture_output=True,
+            check=False, capture_output=True,
         ).returncode == 0
 
     wait_for(mysql_ready, 120, "MySQL 就绪")
     time.sleep(2)
-    exec_sql = lambda sql: run([  # noqa: E731
+    exec_sql = lambda sql: run([
         "docker", "exec", "-i", name, "mysql", "-uroot", f"-p{PASSWORD}", "-e", sql,
     ])
     exec_sql(
@@ -89,7 +89,21 @@ def test_mysql(tmp: Path) -> None:
     after = exec_sql("SELECT COUNT(*) FROM demo.t;")
     print(f"   恢复前行数输出 {before!r}，恢复后 {after!r}")
     assert "2" in after, after
-    print("✅ MySQL 备份/恢复通过")
+
+    print("→ 加密备份 → 再删库 → 用口令恢复")
+    secret = "OpsMate_Backup_Pass"
+    enc = db.backup(target, out_dir=tmp, password=secret)
+    print(f"   加密备份 {enc.name}")
+    exec_sql("DROP DATABASE demo;")
+    print("  ", db.restore(target, enc, confirm=True, password=secret))
+    assert "2" in exec_sql("SELECT COUNT(*) FROM demo.t;")
+
+    print("→ 恢复演练报告（加密备份）")
+    report = db.drill(target, enc, password=secret)
+    text = report.read_text("utf-8")
+    assert "✅ 恢复成功" in text and "| demo | 1 |" in text, text[:300]
+    print(f"   报告 {report.name}")
+    print("✅ MySQL 备份/恢复/加密/演练通过")
 
 
 def test_postgres(tmp: Path) -> None:
@@ -105,12 +119,12 @@ def test_postgres(tmp: Path) -> None:
     wait_for(
         lambda: subprocess.run(
             ["docker", "exec", name, "pg_isready", "-U", "postgres"],
-            capture_output=True,
+            check=False, capture_output=True,
         ).returncode == 0,
         90, "PostgreSQL 就绪",
     )
     time.sleep(2)
-    psql = lambda sql: run([  # noqa: E731
+    psql = lambda sql: run([
         "docker", "exec", "-i", name, "psql", "-U", "postgres", "-d", "demo",
         "-v", "ON_ERROR_STOP=1", "-c", sql,
     ])

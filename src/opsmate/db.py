@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import atexit
 import gzip
 import os
 import shutil
@@ -19,11 +20,11 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from opsmate import config
+from opsmate import config, crypto
 
 ENGINES = {"mysql": 3306, "postgres": 5432}
 DEFAULT_IMAGES = {"mysql": "mysql:8", "postgres": "postgres:16"}
@@ -140,47 +141,86 @@ def _wait_port(port: int, timeout: float = 10.0) -> None:
     raise DbError(f"SSH 隧道没起来（本地端口 {port} 连不上）")
 
 
+class TunnelPool:
+    """同一进程内复用 ssh -L 连接（同跳板+同目标端口只开一条）。"""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str, int], dict[str, Any]] = {}
+
+    def acquire(self, target: DbTarget, inventory: Any | None = None) -> dict[str, Any]:
+        from dataclasses import replace
+
+        from landui_sdk.ssh import build_ssh_command, ssh_env
+
+        from opsmate.inventory import Inventory
+
+        key = (target.ssh_host_id, target.host, target.port)
+        entry = self._entries.get(key)
+        if entry is not None and entry["proc"].poll() is None:
+            entry["uses"] += 1
+            return entry
+        if entry is not None:
+            entry["proc"].kill()
+
+        inventory = inventory or Inventory.load()
+        host = inventory.by_id(target.ssh_host_id)
+        if host is None:
+            raise DbError(f"隧道主机不存在：{target.ssh_host_id}")
+
+        local_port = _free_port()
+        ssh_args = build_ssh_command(host.target())
+        cmd = [
+            "ssh", "-N",
+            "-L", f"127.0.0.1:{local_port}:{target.host}:{target.port}",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            *ssh_args[1:],
+        ]
+        proc = subprocess.Popen(
+            cmd, env=ssh_env(host.target()),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        _wait_port(local_port)
+        entry = {
+            "proc": proc, "port": local_port, "uses": 1,
+            "scoped": replace(target, host="127.0.0.1", port=local_port),
+        }
+        self._entries[key] = entry
+        return entry
+
+    def close_all(self) -> None:
+        for entry in self._entries.values():
+            proc = entry["proc"]
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._entries.clear()
+
+
+_POOL = TunnelPool()
+
+
+def close_tunnels() -> None:
+    _POOL.close_all()
+
+
+atexit.register(close_tunnels)
+
+
 @contextmanager
 def tunnel(target: DbTarget, inventory: Any | None = None):
-    """需要时开一个 ssh -L 本地转发，yield 改写过 host/port 的 target。"""
+    """需要时开一个 ssh -L 本地转发；同进程内复用，进程退出时统一关闭。"""
     if not target.ssh_host_id:
         yield target
         return
-
-
-    from landui_sdk.ssh import build_ssh_command, ssh_env
-
-    from opsmate.inventory import Inventory
-
-    inventory = inventory or Inventory.load()
-    host = inventory.by_id(target.ssh_host_id)
-    if host is None:
-        raise DbError(f"隧道主机不存在：{target.ssh_host_id}")
-
-    local_port = _free_port()
-    cmd = [
-        "ssh", "-N",
-        "-L", f"127.0.0.1:{local_port}:{target.host}:{target.port}",
-        "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=3",
-    ]
-    ssh_args = build_ssh_command(host.target())
-    # build_ssh_command 末尾是 user@host，把 -p 端口等选项接在前面
-    cmd += ssh_args[1:]
-    proc = subprocess.Popen(
-        cmd, env=ssh_env(host.target()),
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-    )
+    entry = _POOL.acquire(target, inventory)
     try:
-        _wait_port(local_port)
-        yield replace(target, host="127.0.0.1", port=local_port)
+        yield entry["scoped"]
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        entry["uses"] -= 1
 
 
 def _via_tunnel(target: DbTarget) -> Any:
@@ -198,16 +238,24 @@ def list_databases(target: DbTarget, timeout: float = 20) -> list[str]:
         return _list_databases(scoped, timeout)
 
 
-def backup(target: DbTarget, out_dir: Path | None = None) -> Path:
+def backup(
+    target: DbTarget, out_dir: Path | None = None, password: str | None = None
+) -> Path:
     with _via_tunnel(target) as scoped:
-        path = _backup(scoped, out_dir)
+        path = _backup(scoped, out_dir, password)
     target.last_backup = time.strftime("%Y-%m-%dT%H:%M:%S")
     return path
 
 
-def restore(target: DbTarget, archive: str | Path, *, confirm: bool = False) -> str:
+def restore(
+    target: DbTarget,
+    archive: str | Path,
+    *,
+    confirm: bool = False,
+    password: str | None = None,
+) -> str:
     with _via_tunnel(target) as scoped:
-        return _restore(scoped, archive, confirm=confirm)
+        return _restore(scoped, archive, confirm=confirm, password=password)
 
 
 # --------------------------------------------------------------------- 执行器
@@ -273,8 +321,9 @@ def _run(cmd: list[str], runner: Runner, *, timeout: float | None = None,
          stdout: Any = None, stdin: Any = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            cmd, check=False, env=runner.env(), stdout=stdout, stdin=stdin,
-            stderr=subprocess.PIPE, text=False, timeout=timeout,
+            cmd, check=False, env=runner.env(),
+            stdout=subprocess.PIPE if stdout is None else stdout,
+            stdin=stdin, stderr=subprocess.PIPE, text=False, timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise DbError(f"命令不存在：{cmd[0]}") from exc
@@ -337,14 +386,17 @@ def _slug(text: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "-" for c in text).strip("-") or "db"
 
 
-def _backup(target: DbTarget, out_dir: Path | None = None) -> Path:
+def _backup(
+    target: DbTarget, out_dir: Path | None = None, password: str | None = None
+) -> Path:
     runner = resolve_runner(target)
     out_dir = out_dir or (config.backups_dir() / "db")
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{_slug(target.name)}-{target.engine}-{_stamp()}"
+    suffix = ".enc" if password else ""
 
     if target.engine == "mysql":
-        path = out_dir / f"{stem}.sql.gz"
+        path = out_dir / f"{stem}.sql.gz{suffix}"
         cmd = runner.tool("mysqldump") + [
             "--host", runner.host_arg(), "--port", str(target.port),
             "--user", target.user, "--single-transaction", "--quick",
@@ -352,20 +404,20 @@ def _backup(target: DbTarget, out_dir: Path | None = None) -> Path:
             "--default-character-set=utf8mb4",
         ]
         cmd += ["--all-databases"] if not target.databases else ["--databases", *target.databases]
-        _backup_gz(cmd, runner, path)
+        _backup_gz(cmd, runner, path, password)
         return path
 
     if not target.databases:
-        path = out_dir / f"{stem}.sql.gz"
+        path = out_dir / f"{stem}.sql.gz{suffix}"
         cmd = runner.tool("pg_dumpall") + [
             "--host", runner.host_arg(), "--port", str(target.port),
             "--username", target.user, "--clean", "--if-exists", "--no-owner",
         ]
-        _backup_gz(cmd, runner, path)
+        _backup_gz(cmd, runner, path, password)
         return path
 
     # PostgreSQL 指定库：每个库一份 custom dump，打包成 tar.gz
-    path = out_dir / f"{stem}.tar.gz"
+    path = out_dir / f"{stem}.tar.gz{suffix}"
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         for db in target.databases:
@@ -382,22 +434,45 @@ def _backup(target: DbTarget, out_dir: Path | None = None) -> Path:
                 proc = _run([*base, "--file", str(dump)], runner)
             if proc.returncode != 0:
                 raise DbError(_err(proc) or f"备份 {db} 失败")
-        with tarfile.open(path, "w:gz") as tar:
-            for dump in tmp_path.iterdir():
-                tar.add(dump, arcname=dump.name)
+        if password:
+            writer = crypto.EncryptingWriter(path, password)
+            try:
+                with tarfile.open(fileobj=writer, mode="w:gz") as tar:
+                    for dump in tmp_path.iterdir():
+                        tar.add(dump, arcname=dump.name)
+            except Exception:
+                writer.abort()
+                raise
+            writer.close()
+        else:
+            with tarfile.open(path, "w:gz") as tar:
+                for dump in tmp_path.iterdir():
+                    tar.add(dump, arcname=dump.name)
     return path
 
 
-def _backup_gz(cmd: list[str], runner: Runner, path: Path) -> None:
-    # 注意：不能把 gzip 文件对象直接交给 stdout（subprocess 会绕过压缩缓冲），
-    # 必须从管道读字节再写进 gzip。
+def _backup_gz(
+    cmd: list[str], runner: Runner, path: Path, password: str | None = None
+) -> None:
+    # 不能把 gzip 文件对象直接交给 stdout（subprocess 会绕过压缩缓冲），
+    # 必须从管道读字节再写进 gzip。加密时再套一层 EncryptingWriter。
     proc = subprocess.Popen(
         cmd, env=runner.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    with gzip.open(path, "wb") as fh:
-        assert proc.stdout is not None
-        shutil.copyfileobj(proc.stdout, fh)
-        proc.stdout.close()
+    writer = crypto.EncryptingWriter(path, password) if password else None
+    try:
+        with gzip.GzipFile(fileobj=writer, filename="", mode="wb") if writer else gzip.open(path, "wb") as fh:
+            assert proc.stdout is not None
+            shutil.copyfileobj(proc.stdout, fh)
+            proc.stdout.close()
+        if writer:
+            writer.close()
+    except Exception:
+        if writer:
+            writer.abort()
+        else:
+            path.unlink(missing_ok=True)
+        raise
     err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace").strip()
     code = proc.wait()
     if code != 0:
@@ -406,13 +481,26 @@ def _backup_gz(cmd: list[str], runner: Runner, path: Path) -> None:
 
 
 # --------------------------------------------------------------------- 恢复
-def _restore(target: DbTarget, archive: str | Path, *, confirm: bool = False) -> str:
+def _restore(
+    target: DbTarget,
+    archive: str | Path,
+    *,
+    confirm: bool = False,
+    password: str | None = None,
+) -> str:
     """覆盖式恢复：会 DROP 已有对象再导入，务必先确认。"""
     if not confirm:
         raise DbError("恢复会覆盖现有数据，需要显式 confirm=True")
     archive = Path(archive).expanduser()
     if not archive.exists():
         raise FileNotFoundError(archive)
+
+    if crypto.is_encrypted(archive):
+        if not password:
+            raise DbError("这是加密备份，需要提供口令")
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = crypto.decrypt_file(archive, password, Path(tmp) / archive.name[:-4])
+            return _restore(target, plain, confirm=True)
     runner = resolve_runner(target)
 
     if target.engine == "mysql":
@@ -536,7 +624,11 @@ def autobackup(*, force: bool = False, catalog: DbCatalog | None = None) -> list
 
 
 def restore_with_safety(
-    target: DbTarget, archive: str | Path, *, confirm: bool = False
+    target: DbTarget,
+    archive: str | Path,
+    *,
+    confirm: bool = False,
+    password: str | None = None,
 ) -> str:
     """恢复前先给当前状态拍一份快照，失败了也能回头。"""
     if not confirm:
@@ -547,7 +639,115 @@ def restore_with_safety(
         safety = backup(target, out_dir=_backup_dir() / "pre-restore")
     except Exception as exc:  # noqa: BLE001 - 库已经坏了也要允许恢复
         warning = f"（当前状态快照失败：{type(exc).__name__}: {exc}）"
-    message = restore(target, archive, confirm=True)
+    message = restore(target, archive, confirm=True, password=password)
     if safety is not None:
         return f"{message}；恢复前快照：{safety.name}"
     return message + warning
+
+
+# --------------------------------------------------------------------- 恢复演练
+def _table_counts(target: DbTarget) -> dict[str, int]:
+    runner = resolve_runner(target)
+    counts: dict[str, int] = {}
+    if target.engine == "mysql":
+        cmd = runner.tool("mysql") + [
+            "--host", runner.host_arg(), "--port", str(target.port),
+            "--user", target.user, "-N", "-B", "-e",
+            (
+                "SELECT table_schema, COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema NOT IN "
+                "('information_schema','performance_schema','mysql','sys') "
+                "GROUP BY table_schema;"
+            ),
+        ]
+        proc = _run(cmd, runner, timeout=30)
+        if proc.returncode == 0:
+            for line in proc.stdout.decode("utf-8", "replace").splitlines():
+                schema, _, value = line.partition("\t")
+                if schema and value.strip().isdigit():
+                    counts[schema] = int(value)
+        return counts
+
+    dbs = target.databases or list_databases(target)[:5]
+    for db in dbs:
+        cmd = runner.tool("psql") + [
+            "--host", runner.host_arg(), "--port", str(target.port),
+            "--username", target.user, "--dbname", db, "-tAc",
+            (
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema NOT IN ('pg_catalog','information_schema');"
+            ),
+        ]
+        proc = _run(cmd, runner, timeout=30)
+        if proc.returncode == 0:
+            value = proc.stdout.decode("utf-8", "replace").strip()
+            if value.isdigit():
+                counts[db] = int(value)
+    return counts
+
+
+def drill(
+    target: DbTarget,
+    archive: str | Path,
+    *,
+    password: str | None = None,
+    out_dir: Path | None = None,
+) -> Path:
+    """恢复演练：快照 → 覆盖恢复 → 校验 → 生成 Markdown 报告。"""
+    started = time.time()
+    safety: Path | None = None
+    safety_err = ""
+    restore_err = ""
+    version = ""
+    dbs: list[str] = []
+    counts: dict[str, int] = {}
+
+    try:
+        safety = backup(target)
+    except Exception as exc:  # noqa: BLE001 - 快照失败不阻断演练
+        safety_err = f"{type(exc).__name__}: {exc}"
+
+    try:
+        restore(target, archive, confirm=True, password=password)
+    except Exception as exc:  # noqa: BLE001 - 写进报告再抛
+        restore_err = f"{type(exc).__name__}: {exc}"
+    else:
+        try:
+            version = test_connection(target)
+            dbs = list_databases(target)
+            counts = _table_counts(target)
+        except Exception as exc:  # noqa: BLE001
+            restore_err = f"恢复后校验失败：{type(exc).__name__}: {exc}"
+
+    elapsed = time.time() - started
+    reports = (out_dir or (config.home() / "reports"))
+    reports.mkdir(parents=True, exist_ok=True)
+    path = reports / f"restore-{_slug(target.name)}-{_stamp()}.md"
+    lines = [
+        f"# 恢复演练报告：{target.name}",
+        "",
+        f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        (
+            f"- 目标：{target.engine} {target.user}@{target.host}:{target.port}"
+            f"（{'全部库' if not target.databases else ','.join(target.databases)}）"
+        ),
+        f"- 备份文件：`{archive}`",
+        f"- 耗时：{elapsed:.1f}s",
+        f"- 恢复前快照：`{safety}`" if safety else f"- 恢复前快照：失败（{safety_err}）",
+        "",
+        "## 结果",
+        "",
+        ("❌ 失败：" + restore_err) if restore_err else "✅ 恢复成功",
+        "",
+    ]
+    if version:
+        lines += ["## 校验", "", f"- 版本：{version.splitlines()[0][:120]}",
+                  f"- 数据库：{', '.join(dbs) or '（无）'}", ""]
+        if counts:
+            lines += ["| 库 | 表数量 |", "| --- | --- |"]
+            lines += [f"| {name} | {value} |" for name, value in counts.items()]
+            lines.append("")
+    path.write_text("\n".join(lines), "utf-8")
+    if restore_err:
+        raise DbError(f"{restore_err}（报告：{path}）")
+    return path
