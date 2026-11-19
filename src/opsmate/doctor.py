@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import shutil
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
 
-from opsassistant.config import landui_auth_path
+from opsmate.config import landui_auth_path
 
 OK = "ok"
 WARN = "warn"
@@ -68,9 +69,62 @@ def check_terminal() -> Check:
     return Check("终端", OK, found[0])
 
 
+def check_tool(name: str, label: str | None = None, *, required: bool = False) -> Check:
+    path = shutil.which(name)
+    label = label or name
+    if path:
+        return Check(label, OK, path)
+    return Check(label, FAIL if required else WARN, f"未安装（{name}）")
+
+
+def check_ssh_keygen() -> Check:
+    from opsmate.sshkeys import find_tool
+
+    path = find_tool("ssh-keygen")
+    return Check("ssh-keygen", OK, path) if path else Check("ssh-keygen", WARN, "未安装")
+
+
+def check_docker() -> Check:
+    path = shutil.which("docker")
+    if not path:
+        return Check("docker", WARN, "未安装（没有本地数据库客户端时才会用到）")
+    try:
+        proc = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            check=False, capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return Check("docker", WARN, f"{path}（服务不可用）")
+    if proc.returncode != 0:
+        return Check("docker", WARN, f"{path}（服务未启动）")
+    return Check("docker", OK, f"{path}（server {proc.stdout.strip()}）")
+
+
+def check_db_clients() -> Check:
+    found = [name for name in ("mysqldump", "mysql", "pg_dump", "psql") if shutil.which(name)]
+    if not found:
+        return Check("数据库客户端", WARN, "没有本机 mysql/pg 客户端，可用 Docker 模式")
+    return Check("数据库客户端", OK, ", ".join(found))
+
+
+def check_gh() -> Check:
+    path = shutil.which("gh")
+    if not path:
+        return Check("gh (GitHub CLI)", WARN, "未安装（上传公钥需要）")
+    try:
+        proc = subprocess.run(
+            [path, "auth", "status"], check=False, capture_output=True, text=True, timeout=8
+        )
+    except (OSError, subprocess.SubprocessError):
+        return Check("gh (GitHub CLI)", WARN, path)
+    if proc.returncode != 0:
+        return Check("gh (GitHub CLI)", WARN, "未登录（gh auth login）")
+    return Check("gh (GitHub CLI)", OK, "已登录")
+
+
 def check_login_online() -> Check:
     """真的打一次控制台接口，确认 Cookie 没过期。"""
-    from opsassistant import landui
+    from opsmate import landui
 
     try:
         ok = landui.client().is_logged_in()
@@ -86,6 +140,10 @@ def run_checks(online: bool = False) -> list[Check]:
         check_auth(),
         check_ssh(),
         check_terminal(),
+        check_ssh_keygen(),
+        check_gh(),
+        check_docker(),
+        check_db_clients(),
     ]
     if online:
         checks.append(check_login_online())

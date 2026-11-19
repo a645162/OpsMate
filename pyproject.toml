@@ -1,28 +1,33 @@
 [project]
-name = "opsassistant"
+name = "opsmate"
 version = "0.1.0"
-description = "运维助手（OpsAssistant）—— 本地服务器运维台"
+description = "运维助手（OpsMate）—— 本地服务器运维台"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
+    "pyyaml>=6.0",
     "landui-sdk>=0.1.0",
 ]
 
+[project.optional-dependencies]
+gui = ["pyside6>=6.7"]
+
 [project.scripts]
-ops = "opsassistant.cli:main"
+ops = "opsmate.cli:main"
+ops-gui = "opsmate.gui.app:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/opsassistant"]
+packages = ["src/opsmate"]
 
 # 蓝队云 SDK 还没发布到 PyPI，本地开发直接指向隔壁仓库。
 # 以后发布了就删掉这两行、改成普通版本依赖。
 [tool.uv.sources]
-landui-sdk = { path = "../../LanduiSDK", editable = true }
+landui-sdk = { path = "libs/LanduiSDK", editable = true }
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.5"]

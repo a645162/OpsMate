@@ -6,7 +6,7 @@ import os
 
 from landui_sdk import LanduiClient, LanduiError, NotLoggedInError
 
-from opsassistant.config import landui_auth_path
+from opsmate.config import landui_auth_path
 
 
 def client(auth_file: str | os.PathLike | None = None) -> LanduiClient:

@@ -1,69 +1,109 @@
-# OpsAssistant · 运维助手
+# OpsMate · 运维助手
 
-> 一个本地优先的服务器运维台：把「看一眼 → 连上去 → 改一下」压缩到最短路径。
+> 本地优先的服务器运维台：**主机清单、SSH 密钥、~/.ssh/config、终端配置、数据库备份**，
+> 一个窗口 / 一套命令搞定。Windows、Linux、macOS 都能跑。
 >
-> 目前接入的第一个云厂商是**蓝队云（landui.com）**，通过第三方 SDK
-> [`landui-sdk`](../LanduiSDK) 调用其控制台接口。
-> **本项目与蓝队云官方无任何隶属、合作或授权关系**，接口来自公开网页前端整理，
-> 可能随时变更。
+> 蓝队云（landui.com）接入是通过第三方 SDK [`libs/LanduiSDK`](libs/LanduiSDK) 完成的，
+> **本项目与蓝队云官方无任何隶属、合作或授权关系**。
 
-## 为什么叫 OpsAssistant
+![SSH 密钥](docs/screenshot-keys.png)
 
-「运维助手」直译是 Operations Assistant，取 **OpsAssistant**：
-拼写直白、搜索友好，缩写成 `ops` 又好敲（命令就是 `ops`）。
+## 功能
 
-## 现在能做什么
+| 模块 | 能做什么 |
+| --- | --- |
+| 服务器清单 | 本地维护主机（名称/地址/端口/用户/认证/标签），从蓝队云一键导入，双击直连 |
+| SSH 密钥 | 列出、生成（ed25519/rsa/ecdsa，可带口令）、复制公钥、装到服务器、**上传到 GitHub**、删除 |
+| ~/.ssh/config | 查看、编辑、**每次写入自动备份**、把清单同步进托管块（块外内容原样保留） |
+| 终端集成 | 导出 / 直接写入 **Tabby** 和 **Windows Terminal** 的 profile（写前备份） |
+| 数据库 | **MySQL / PostgreSQL 全库备份与覆盖恢复**；本机客户端或 Docker 模式 |
+| 蓝队云 | 服务器列表、开关机、防火墙（通过 LanduiSDK，见其 README） |
+
+## 快速开始
 
 ```bash
-uv sync                 # 安装（会以 path 依赖方式装上隔壁的 LanduiSDK）
-uv run ops doctor       # 自检：Python / SDK / 登录态 / ssh / 终端
-uv run ops servers      # 列出云服务器
-uv run ops ssh 10001    # 用已保存的账号打开 SSH
+uv sync                    # 核心（含 landui-sdk 子模块依赖）
+uv sync --extra gui        # 图形界面
+
+uv run ops-gui             # 图形界面
+uv run ops doctor          # 环境自检
 ```
 
-`doctor` 输出示例：
+首次使用：
 
-```
-✅ Python        3.14.10
-✅ landui-sdk    0.1.0
-✅ 登录态        /home/you/.config/landui-sdk/auth.json
-✅ ssh 客户端    /usr/bin/ssh
-✅ 终端          /usr/bin/x-terminal-emulator
-```
-
-## 目录
-
-```
-src/opsassistant/
-  cli.py        ops 命令（version / doctor / servers / ssh）
-  doctor.py     环境自检（纯函数，便于复用到 GUI）
-  landui.py     蓝队云接入的薄封装（错误翻译成人话）
-  config.py     ~/.config/opsassistant/ 与 settings.json
-tests/          离线测试
+```bash
+uv run ops hosts add --name demo --host 203.0.113.10 --port 2222 --user deploy \
+    --auth key --key ~/.ssh/id_ed25519
+uv run ops keys new id_ed25519 --comment "me@laptop"
+uv run ops keys install demo id_ed25519      # 写进远端 authorized_keys
+uv run ops keys github id_ed25519 --title "laptop"
+uv run ops config sync                       # 写 ~/.ssh/config 托管块
 ```
 
-## 与 LanduiSDK 的关系
+## 命令一览
 
-* 登录态、SSH 账号、密码都复用 `~/.config/landui-sdk/`，**不复制一份**，
-  避免同一份凭据散落多处。
-* 依赖通过 `pyproject.toml` 的 `[tool.uv.sources]` 指向 `../../LanduiSDK`；
-  等 SDK 发布到 PyPI 后删掉那段即可。
+```bash
+ops doctor [--online]             # 自检（含 ssh-keygen / gh / docker / 数据库客户端）
+ops servers                       # 蓝队云实例
+ops hosts list|add|rm|import      # 本地主机清单
+ops keys list|new|show|install|github|delete
+ops config show|backup|sync|edit  # ~/.ssh/config（自动备份）
+ops export ssh|tabby|wt [--apply]
+ops db list|add|rm|test|databases|backup|restore
+ops ssh <主机 ID 或名称>
+```
 
-## 路线图
+图形界面：`ops-gui`（五个页签：服务器 / SSH 密钥 / SSH 配置 / 导出 / 数据库）。
 
-- [ ] 图形界面：服务器列表 + 一键 SSH（复用 LanduiSDK 的组件）
-- [ ] 多厂商抽象：`Provider` 接口，蓝队云只是第一个实现
-- [ ] 批量操作：多选开关机、批量执行命令
-- [ ] 到期/欠费提醒
-- [ ] 本地凭据迁移到系统钥匙串
+## 数据库备份（重点）
+
+* **MySQL**：`mysqldump --single-transaction --routines --triggers --events --add-drop-database`，
+  可选「全部库」或指定库；输出 `.sql.gz`。
+* **PostgreSQL**：全部库用 `pg_dumpall --clean --if-exists`（`.sql.gz`）；
+  指定库用 `pg_dump -Fc` 逐库导出后打包（`.tar.gz`）。
+* **恢复是覆盖式的**：MySQL 脚本自带 `DROP DATABASE`；PostgreSQL 用
+  `pg_restore --clean --if-exists`。命令行必须加 `--yes`，GUI 有二次确认。
+* 密码只通过环境变量 `MYSQL_PWD` / `PGPASSWORD` 传递，不进入命令行参数。
+* 没有本机客户端时自动改用 Docker（`docker run --rm -i mysql:8 …`），
+  镜像可配置；本机连通性用 `--network host`。
+
+实测（Docker 真实容器，`uv run python scripts/db_docker_test.py`）：
+
+```
+→ MySQL：备份 → DROP DATABASE demo → 恢复 → 行数 2 ✅
+→ PostgreSQL：pg_dump -Fc → DROP TABLE → pg_restore --clean → 行数 2 ✅
+```
+
+备份文件默认在 `~/.config/opsmate/backups/db/`。
+
+## 文件位置
+
+| 内容 | 路径 |
+| --- | --- |
+| 主机清单 / 数据库目标 | `~/.config/opsmate/hosts.json`、`databases.json`（0600） |
+| 备份 | `~/.config/opsmate/backups/` |
+| 导出片段 | `~/.config/opsmate/exports/` |
+| SSH 密钥 | `~/.ssh/` |
+| 蓝队云登录态 | `~/.config/landui-sdk/auth.json`（复用，不复制） |
+
+Windows 下配置目录是 `%APPDATA%\opsmate`，其余路径同样基于用户主目录。
 
 ## 开发
 
 ```bash
 uv run pytest -q
 uv run ruff check src tests
+uv run python scripts/db_docker_test.py   # 需要 docker
+```
+
+依赖的蓝队云 SDK 以 **git submodule** 放在 `libs/LanduiSDK`：
+
+```bash
+git clone --recurse-submodules <repo>
+# 或
+git submodule update --init --recursive
 ```
 
 ## 许可
 
-MIT。第三方接口的使用风险与合规责任由使用者承担。
+MIT。第三方接口与破坏性操作（覆盖恢复、删除密钥）的风险由使用者承担。

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import stat
 
-from opsassistant import __version__, config, doctor
-from opsassistant.cli import main
+from opsmate import __version__, config, doctor
+from opsmate.cli import main
 
 
 def test_version(capsys):

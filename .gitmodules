@@ -1,0 +1,3 @@
+[submodule "libs/LanduiSDK"]
+	path = libs/LanduiSDK
+	url = https://github.com/a645162/LanduiSDK.git
