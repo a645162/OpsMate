@@ -49,6 +49,10 @@ def db_targets_path() -> Path:
     return home() / "databases.json"
 
 
+def storage_path() -> Path:
+    return home() / "storage.json"
+
+
 def dns_credentials_path() -> Path:
     return home() / "dns.json"
 

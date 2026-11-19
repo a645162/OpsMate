@@ -224,3 +224,25 @@ def test_drill_writes_report(tmp_path, monkeypatch):
     assert "恢复演练报告" in text
     assert "✅ 恢复成功" in text
     assert "| demo | 3 |" in text
+
+
+def test_autobackup_uploads_when_configured(tmp_path, monkeypatch):
+    from opsmate import storage
+
+    monkeypatch.setenv(config.HOME_ENV, str(tmp_path / "home"))
+    target = db.DbTarget(name="due", schedule_hours=1, upload_to="bucket")
+    catalog = db.DbCatalog(targets=[target])
+
+    monkeypatch.setattr(db, "backup", lambda *a, **k: tmp_path / "b.sql.gz")
+    monkeypatch.setattr(db, "prune", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        storage.StorageStore, "load",
+        classmethod(lambda cls: storage.StorageStore(targets=[
+            storage.StorageTarget(name="bucket", bucket="b")
+        ])),
+    )
+    uploaded = []
+    monkeypatch.setattr(storage, "upload", lambda dest, path: uploaded.append(path) or "s3://b/x")
+
+    results = db.autobackup(catalog=catalog)
+    assert uploaded and "已上传" in results[0][1]

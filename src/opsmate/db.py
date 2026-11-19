@@ -58,6 +58,7 @@ class DbTarget:
     schedule_hours: int = 0                              # 自动备份间隔，0=关闭
     keep: int = 7                                        # 保留最近几份
     last_backup: str = ""                                # ISO 时间
+    upload_to: str = ""                                  # 对象存储目标名，空=不上传
     note: str = ""
     id: str = field(default_factory=new_id)
 
@@ -611,11 +612,24 @@ def autobackup(*, force: bool = False, catalog: DbCatalog | None = None) -> list
             continue
         try:
             path = backup(target)
+            remote = ""
+            if target.upload_to:
+                from opsmate import storage
+
+                store = storage.StorageStore.load()
+                dest = store.by_name(target.upload_to) or store.by_id(target.upload_to)
+                if dest is None:
+                    remote = f"（上传失败：找不到存储 {target.upload_to}）"
+                else:
+                    try:
+                        remote = "，已上传 " + storage.upload(dest, path)
+                    except Exception as exc:  # noqa: BLE001
+                        remote = f"（上传失败：{type(exc).__name__}: {exc}）"
             removed = prune(target)
             target.last_backup = time.strftime("%Y-%m-%dT%H:%M:%S")
             changed = True
             extra = f"（清理 {removed} 份旧备份）" if removed else ""
-            results.append((target.name, f"{path}{extra}"))
+            results.append((target.name, f"{path}{extra}{remote}"))
         except Exception as exc:  # noqa: BLE001 - 单个失败不影响其它
             results.append((target.name, f"失败：{type(exc).__name__}: {exc}"))
     if changed:

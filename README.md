@@ -17,7 +17,8 @@
 | ~/.ssh/config | 查看、编辑、**每次写入自动备份**、把清单同步进托管块（块外内容原样保留） |
 | 终端集成 | 导出 / 直接写入 **Tabby** 和 **Windows Terminal** 的 profile（写前备份） |
 | 数据库 | **MySQL / PostgreSQL 全库备份与覆盖恢复**；本机客户端或 Docker 模式；**SSH 隧道（连接复用）**、**定时备份 + 保留**、**恢复前快照**、**AES-256 加密备份**、**恢复演练报告** |
-| DNS 解析 | **Cloudflare** 与 **阿里云解析**：域名列表、记录增删改查（CLI + GUI） |
+| DNS 解析 | **Cloudflare** 与 **阿里云解析**：域名、记录增删改查（CLI + GUI 录入凭据） |
+| 上云 | 备份自动/手动上传到 **S3 / MinIO / 阿里云 OSS**（boto3 可选） |
 | 打包 | **Nuitka** 独立程序（Windows/Linux）+ **NSIS** 安装包脚本 |
 | 蓝队云 | 服务器列表、开关机、防火墙（通过 LanduiSDK，见其 README） |
 
@@ -96,7 +97,7 @@ ops dns rm cf example.com <record_id> --yes
 
 * Cloudflare 走 API Token；阿里云走 Aliyun DNS RPC（HMAC-SHA1 签名，已含在代码里）
 * 凭据存 `~/.config/opsmate/dns.json`（0600），建议用只含 DNS 权限的 RAM 子账号
-* GUI「DNS」页签：选凭据 → 选域名 → 记录增删，支持代理开关与线路
+* GUI「DNS」页签：可直接添加/删除凭据、选域名、记录增删，支持代理开关与线路
 
 ## 打包（Nuitka + NSIS）
 
@@ -127,7 +128,7 @@ Windows 下配置目录是 `%APPDATA%\opsmate`，其余路径同样基于用户�
 ## 开发
 
 ```bash
-uv run pytest -q
+uv run pytest -q          # 54 个离线测试
 uv run ruff check src tests
 uv run python scripts/db_docker_test.py   # 需要 docker
 ```

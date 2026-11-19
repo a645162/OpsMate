@@ -296,6 +296,48 @@ class DbDialog(QDialog):
         )
 
 
+class DnsCredDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加 DNS 凭据")
+        self.setMinimumWidth(460)
+        form = QFormLayout(self)
+        self.ed_name = QLineEdit()
+        self.ed_name.setPlaceholderText("例如 cf-main / ali-prod")
+        self.cb_provider = QComboBox()
+        self.cb_provider.addItems(["cloudflare", "aliyun"])
+        self.ed_token = QLineEdit()
+        self.ed_token.setEchoMode(QLineEdit.Password)
+        self.ed_token.setPlaceholderText("Cloudflare API Token")
+        self.ed_ak = QLineEdit()
+        self.ed_ak.setPlaceholderText("AccessKeyId")
+        self.ed_sk = QLineEdit()
+        self.ed_sk.setEchoMode(QLineEdit.Password)
+        self.ed_sk.setPlaceholderText("AccessKeySecret")
+
+        form.addRow("名称", self.ed_name)
+        form.addRow("提供商", self.cb_provider)
+        form.addRow("API Token", self.ed_token)
+        form.addRow("AccessKeyId", self.ed_ak)
+        form.addRow("AccessKeySecret", self.ed_sk)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("保存")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        form.addRow(buttons)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+    def value(self) -> dns.DnsCredential:
+        return dns.DnsCredential(
+            name=self.ed_name.text().strip() or self.cb_provider.currentText(),
+            provider=self.cb_provider.currentText(),
+            token=self.ed_token.text().strip(),
+            access_key_id=self.ed_ak.text().strip(),
+            access_key_secret=self.ed_sk.text().strip(),
+        )
+
+
 class DnsRecordDialog(QDialog):
     def __init__(self, provider: str, parent=None):
         super().__init__(parent)
@@ -710,6 +752,7 @@ class MainWindow(QMainWindow):
             ("备份", self.backup_db),
             ("恢复（覆盖）", self.restore_db),
             ("恢复演练", self.drill_db),
+            ("上传备份", self.upload_backup),
         ):
             btn = QPushButton(text)
             btn.clicked.connect(slot)
@@ -841,6 +884,33 @@ class MainWindow(QMainWindow):
             lambda m: self.lbl_db.setText("❌ " + m),
         )
 
+    def upload_backup(self) -> None:
+        from opsmate import storage
+
+        store = storage.StorageStore.load()
+        if not store.targets:
+            err_box(self, "还没有对象存储：ops storage add <名称> --bucket ...")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要上传的备份", str(config.backups_dir() / "db"),
+            "备份 (*.sql.gz *.tar.gz *.enc)",
+        )
+        if not path:
+            return
+        from PySide6.QtWidgets import QInputDialog
+
+        names = [t.name for t in store.targets]
+        name, ok = QInputDialog.getItem(self, "上传", "目标存储：", names, 0, False)
+        if not ok:
+            return
+        target = next(t for t in store.targets if t.name == name)
+        self.lbl_db.setText("上传中…")
+        run_async(
+            self, lambda: storage.upload(target, path),
+            lambda uri: self.lbl_db.setText(f"✅ 已上传：{uri}"),
+            lambda m: self.lbl_db.setText("❌ " + m),
+        )
+
     def drill_db(self) -> None:
         target = self._selected_db()
         if target is None:
@@ -881,10 +951,12 @@ class MainWindow(QMainWindow):
         self.cb_dns_zone = QComboBox()
         self.cb_dns_zone.setMinimumWidth(220)
         bar.addWidget(self.cb_dns_zone)
+        btn_cred = QPushButton("添加凭据")
+        btn_cred_del = QPushButton("删除凭据")
         btn_refresh = QPushButton("刷新")
         btn_add = QPushButton("添加记录")
         btn_del = QPushButton("删除记录")
-        for b in (btn_refresh, btn_add, btn_del):
+        for b in (btn_cred, btn_cred_del, btn_refresh, btn_add, btn_del):
             bar.addWidget(b)
         bar.addStretch(1)
         v.addLayout(bar)
@@ -906,10 +978,31 @@ class MainWindow(QMainWindow):
 
         self.cb_dns_cred.currentIndexChanged.connect(lambda _i: self._dns_load_zones())
         self.cb_dns_zone.currentIndexChanged.connect(lambda _i: self._dns_load_records())
+        btn_cred.clicked.connect(self._dns_add_cred)
+        btn_cred_del.clicked.connect(self._dns_del_cred)
         btn_refresh.clicked.connect(self.reload_dns)
         btn_add.clicked.connect(self._dns_add)
         btn_del.clicked.connect(self._dns_delete)
         return page
+
+    def _dns_add_cred(self) -> None:
+        dlg = DnsCredDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        cred = dlg.value()
+        store = dns.DnsStore.load()
+        store.upsert(cred)
+        self.reload_dns()
+
+    def _dns_del_cred(self) -> None:
+        cred = self._dns_cred()
+        if cred is None:
+            return
+        if QMessageBox.question(self, "删除凭据", f"删除 {cred.label}？") != QMessageBox.Yes:
+            return
+        store = dns.DnsStore.load()
+        store.remove(cred.id)
+        self.reload_dns()
 
     def reload_dns(self) -> None:
         self.dns_store = dns.DnsStore.load()

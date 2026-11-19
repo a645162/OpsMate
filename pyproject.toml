@@ -14,6 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["pyside6>=6.7"]
 build = ["nuitka>=2.4", "zstandard>=0.22", "ordered-set>=4.1"]
+cloud = ["boto3>=1.34"]
 
 [project.scripts]
 ops = "opsmate.cli:main"

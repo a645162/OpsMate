@@ -315,6 +315,36 @@ def _backup_passphrase(label: str = "备份口令") -> str:
     return getpass.getpass(f"{label}（留空=不加密）: ")
 
 
+# --------------------------------------------------------------------- 对象存储
+def cmd_storage(args: argparse.Namespace) -> int:
+    from opsmate import storage
+
+    store = storage.StorageStore.load()
+    if args.storage_cmd == "list":
+        print_table(
+            ["ID", "名称", "提供商", "bucket", "region", "endpoint", "前缀"],
+            [[t.id, t.name, t.provider, t.bucket, t.region or "-",
+              t.effective_endpoint() or "-", t.prefix] for t in store.targets],
+        )
+        return 0
+    if args.storage_cmd == "add":
+        target = storage.StorageTarget(
+            name=args.name, provider=args.provider, bucket=args.bucket,
+            region=args.region or "", endpoint=args.endpoint or "",
+            access_key=args.access_key or "", prefix=args.prefix,
+        )
+        target.secret_key = getpass.getpass("SecretKey（不回显）: ")
+        store.upsert(target)
+        print(f"已保存存储：{target.id} {target.label}")
+        return 0
+    if args.storage_cmd == "rm":
+        target = pick(store.targets, args.ref, "存储")
+        store.remove(target.id)
+        print(f"已删除 {target.name}")
+        return 0
+    return fail("未知子命令")
+
+
 # --------------------------------------------------------------------- DNS
 def cmd_dns(args: argparse.Namespace) -> int:
     from opsmate import dns
@@ -451,6 +481,7 @@ def cmd_db(args: argparse.Namespace) -> int:
             ssh_host_id=args.ssh_host or "",
             schedule_hours=args.every_hours or 0,
             keep=args.keep,
+            upload_to=args.upload or "",
         )
         if args.ask_password:
             target.password = getpass.getpass("数据库密码（不回显）: ")
@@ -490,9 +521,18 @@ def cmd_db(args: argparse.Namespace) -> int:
             path = db.backup(
                 target, Path(args.out) if args.out else None, password=password or None
             )
+            remote = ""
+            if args.upload:
+                from opsmate import storage
+
+                store = storage.StorageStore.load()
+                dest = store.by_name(args.upload) or store.by_id(args.upload)
+                if dest is None:
+                    return fail(f"找不到存储：{args.upload}")
+                remote = "，已上传 " + storage.upload(dest, path)
         except Exception as exc:  # noqa: BLE001
             return fail(f"{type(exc).__name__}: {exc}")
-        print(f"备份完成：{path}")
+        print(f"备份完成：{path}{remote}")
         return 0
 
     if args.db_cmd == "drill":
@@ -685,6 +725,22 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--apply", action="store_true", help="直接合并到客户端配置")
         item.set_defaults(func=cmd_export)
 
+    storage_parser = sub.add_parser("storage", help="对象存储（S3 / OSS）")
+    storage_sub = storage_parser.add_subparsers(dest="storage_cmd", required=True)
+    storage_sub.add_parser("list", help="列出存储").set_defaults(func=cmd_storage)
+    add_storage = storage_sub.add_parser("add", help="添加存储")
+    add_storage.add_argument("name")
+    add_storage.add_argument("--provider", default="s3", choices=["s3", "oss"])
+    add_storage.add_argument("--bucket", required=True)
+    add_storage.add_argument("--region")
+    add_storage.add_argument("--endpoint", help="MinIO / 自建 S3 地址")
+    add_storage.add_argument("--access-key", required=True)
+    add_storage.add_argument("--prefix", default="opsmate")
+    add_storage.set_defaults(func=cmd_storage)
+    rm_storage = storage_sub.add_parser("rm", help="删除存储")
+    rm_storage.add_argument("ref")
+    rm_storage.set_defaults(func=cmd_storage)
+
     dns_parser = sub.add_parser("dns", help="Cloudflare / 阿里云 DNS 解析")
     dns_sub = dns_parser.add_subparsers(dest="dns_cmd", required=True)
     creds = dns_sub.add_parser("creds", help="管理 DNS 凭据")
@@ -752,6 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--ask-password", action="store_true")
     add.add_argument("--ssh-host", help="通过哪台 SSH 主机做隧道（主机名或 ID）")
     add.add_argument("--every-hours", type=int, default=0, help="自动备份间隔，0=关闭")
+    add.add_argument("--upload", help="自动备份后上传到哪个存储（ops storage 名称）")
     add.add_argument("--keep", type=int, default=7, help="保留最近几份备份")
     add.set_defaults(func=cmd_db)
     for name, help_text in (("rm", "删除目标"), ("test", "测试连接"),
@@ -761,6 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "backup":
             item.add_argument("--out", help="输出目录")
             item.add_argument("--encrypt", action="store_true", help="用口令加密备份")
+            item.add_argument("--upload", help="备份后上传到对象存储（名称）")
         item.set_defaults(func=cmd_db)
     restore = db_sub.add_parser("restore", help="覆盖式恢复")
     restore.add_argument("ref")
